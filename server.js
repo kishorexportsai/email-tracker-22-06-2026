@@ -16,7 +16,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '../frontend')));
+app.use(express.static(path.join(__dirname)));
 
 function getOAuthClient() {
   return new google.auth.OAuth2(
@@ -388,7 +388,7 @@ app.post('/api/trigger/ai-rescan', authMiddleware, async (req, res) => {
   aiRescanExistingEmails().catch(console.error);
 });
 
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../frontend/index.html')));
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 cron.schedule('*/5 * * * *', () => runGmailFetcher().catch(console.error));
 cron.schedule('30 3 * * *', async () => { await sendDailyAgentReminders(); await sendDailyManagerReminders(); });
