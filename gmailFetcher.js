@@ -240,13 +240,20 @@ async function aiRescanExistingEmails() {
   let changed = 0;
 
   for (const email of emails) {
-    // Quick check first
     const obviouslySystem = isObviouslySystem(email.sender_email, [], false);
+    const senderLower = (email.sender_email || '').toLowerCase();
+    const isInternalEmail = ['kishorexports.com', 'kishorexports.ai'].some(d => senderLower.includes(d)) ||
+                            ['kishor.merchant', 'kishorexports', 'kishor.exports'].some(k => senderLower.includes(k));
+
     let status = 'unreplied';
     let aiReason = null;
     let aiConfidence = null;
 
-    if (obviouslySystem) {
+    if (isInternalEmail) {
+      status = 'internal';
+      aiReason = 'Internal Kishor email';
+      aiConfidence = 'high';
+    } else if (obviouslySystem) {
       status = 'no_reply_needed';
       aiReason = 'Auto-detected: system/bulk/bank email';
       aiConfidence = 'high';
@@ -266,14 +273,16 @@ async function aiRescanExistingEmails() {
         aiReason = aiResult.reason;
         aiConfidence = aiResult.confidence;
       }
+      // Rate limit: 4s delay between Gemini calls
+      await new Promise(r => setTimeout(r, 4000));
     }
 
-    if (status === 'no_reply_needed') {
+    if (status === 'no_reply_needed' || status === 'internal') {
       await supabase
         .from('emails')
         .update({
-          status: 'no_reply_needed',
-          is_system_generated: true,
+          status: status,
+          is_system_generated: status === 'no_reply_needed',
           ai_reason: aiReason,
           ai_confidence: aiConfidence,
           updated_at: new Date().toISOString()
@@ -282,8 +291,6 @@ async function aiRescanExistingEmails() {
       changed++;
     }
 
-    // Small delay to avoid hitting rate limits
-    await new Promise(r => setTimeout(r, 300));
   }
 
   console.log(`[AI Rescan] Done. ${changed}/${emails.length} reclassified as no_reply_needed`);
