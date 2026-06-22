@@ -124,6 +124,13 @@ async function fetchGmailEmails(accountEmail) {
       const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
       const isRecent = new Date(receivedAt).getTime() > fifteenDaysAgo;
 
+      // ── INTERNAL EMAIL DETECTION ──────────────────────────────────
+      const INTERNAL_DOMAINS = ['kishorexports.com', 'kishorexports.ai'];
+      const INTERNAL_KEYWORDS = ['kishor.merchant', 'kishorexports', 'kishor.exports'];
+      const senderLower = senderEmail.toLowerCase();
+      const isInternal = INTERNAL_DOMAINS.some(d => senderLower.includes(d)) ||
+                         INTERNAL_KEYWORDS.some(k => senderLower.includes(k));
+
       // ── BCC DETECTION ─────────────────────────────────────────────
       // If our account email is NOT in To or CC, we were BCC'd → no reply needed
       const accountLower = accountEmail.toLowerCase();
@@ -145,7 +152,11 @@ async function fetchGmailEmails(accountEmail) {
       let aiReason = null;
       let aiConfidence = null;
 
-      if (isBcc) {
+      if (isInternal) {
+        status = 'internal';
+        aiReason = 'Internal Kishor email';
+        aiConfidence = 'high';
+      } else if (isBcc) {
         status = 'no_reply_needed';
         aiReason = 'BCC only — no reply needed';
         aiConfidence = 'high';
