@@ -181,6 +181,8 @@ async function fetchGmailEmails(accountEmail) {
           aiReason = aiResult.reason;
           aiConfidence = aiResult.confidence;
         }
+        // Rate limit: wait 4 seconds between Gemini calls (free tier = 15 RPM)
+        await new Promise(r => setTimeout(r, 4000));
         // if AI fails → default stays 'unreplied' (safe fallback)
       }
       // older than 15 days → save as 'unreplied' without AI (you can review manually)
