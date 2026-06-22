@@ -260,19 +260,32 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
   const { role, account_email, email } = req.user;
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const accountFilter = await getAccountFilter(role, account_email, email);
-  if (!accountFilter.length) return res.json({ total: 0, replied: 0, unreplied: 0, today: 0, repliedToday: 0, noReplyNeeded: 0 });
-  const [t, r, u, d, rd, nr] = await Promise.all([
+  if (!accountFilter.length) return res.json({ total: 0, replied: 0, unreplied: 0, today: 0, repliedToday: 0, noReplyNeeded: 0, internal: 0 });
+  const [t, r, u, d, rd, nr, int_] = await Promise.all([
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'replied'),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'unreplied'),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).gte('received_at', today.toISOString()),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'replied').gte('replied_at', today.toISOString()),
-    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'no_reply_needed')
+    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'no_reply_needed'),
+    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'internal')
   ]);
-  res.json({ total: t.count||0, replied: r.count||0, unreplied: u.count||0, today: d.count||0, repliedToday: rd.count||0, noReplyNeeded: nr.count||0 });
+  res.json({ total: t.count||0, replied: r.count||0, unreplied: u.count||0, today: d.count||0, repliedToday: rd.count||0, noReplyNeeded: nr.count||0, internal: int_.count||0 });
 });
 
 // ─── EMAILS ──────────────────────────────────────────────────────
+app.get('/api/emails/internal', authMiddleware, async (req, res) => {
+  const { page = 1, limit = 20, account } = req.query;
+  const filter = account ? [account] : (req.user.accounts || [req.user.email]);
+  let query = supabase.from('emails').select('*', { count: 'exact' })
+    .in('account', filter).eq('status', 'internal')
+    .order('received_at', { ascending: false })
+    .range((page - 1) * limit, page * limit - 1);
+  const { data, count, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ emails: data || [], total: count || 0, page: parseInt(page), limit: parseInt(limit) });
+});
+
 app.get('/api/emails/unreplied', authMiddleware, async (req, res) => {
   const { role, account_email, email } = req.user;
   const { page = 1, limit = 20, account } = req.query;
