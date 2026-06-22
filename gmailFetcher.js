@@ -300,17 +300,17 @@ async function aiRescanExistingEmails() {
 // ── CHECK REPLIES ─────────────────────────────────────────────────
 async function checkGmailReplies(accountEmail, gmail) {
   try {
-    const sinceMs = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days
+    const sinceMs = Date.now() - 60 * 24 * 60 * 60 * 1000; // 60 days
 
     const sentRes = await gmail.users.messages.list({
-      userId: 'me', maxResults: 200, labelIds: ['SENT'],
+      userId: 'me', maxResults: 500, labelIds: ['SENT'],
     });
 
     const sentMessages = sentRes.data.messages || [];
     if (!sentMessages.length) return;
 
     const threadIds = [];
-    for (const msg of sentMessages.slice(0, 100)) {
+    for (const msg of sentMessages.slice(0, 500)) {
       const detail = await gmail.users.messages.get({
         userId: 'me', id: msg.id, format: 'minimal'
       });
