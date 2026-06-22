@@ -163,6 +163,7 @@
       <div class="nav-item active" onclick="showPage('dashboard',this)"><span class="icon">📊</span> Dashboard</div>
       <div class="nav-item" onclick="showPage('unreplied',this)"><span class="icon">⚠️</span> Unreplied Emails</div>
       <div class="nav-item" onclick="showPage('noreply',this)"><span class="icon">🤖</span> No Reply Needed</div>
+      <div class="nav-item" onclick="showPage('internal',this)"><span class="icon">🏢</span> Internal Mails</div>
       <div class="nav-item" onclick="showPage('all',this)"><span class="icon">📬</span> All Emails</div>
       <div class="nav-item" onclick="showPage('weekly',this)"><span class="icon">📈</span> Weekly Report</div>
       <div class="nav-item" onclick="showPage('monthly',this)"><span class="icon">📅</span> Monthly Report</div>
@@ -183,6 +184,7 @@
         <div class="stat-card green"><div class="stat-label">Replied</div><div class="stat-value" id="statReplied">—</div></div>
         <div class="stat-card red"><div class="stat-label">Unreplied</div><div class="stat-value" id="statUnreplied">—</div></div>
         <div class="stat-card grey"><div class="stat-label">Auto-Filtered</div><div class="stat-value" id="statNoReply">—</div></div>
+        <div class="stat-card purple"><div class="stat-label">Internal</div><div class="stat-value" id="statInternal">—</div></div>
       </div>
 
       <!-- Dashboard tabs: Unreplied + No Reply Needed -->
@@ -232,6 +234,22 @@
         </div>
         <div id="noreplyList"><div class="loading">Loading...</div></div>
         <div class="pagination" id="noreplyPagination"></div>
+      </div>
+    </div>
+
+    <!-- INTERNAL MAILS -->
+    <div class="page" id="pageInternal">
+      <div class="page-header"><h1>🏢 Internal Mails</h1><p>Emails sent within Kishor Exports — no reply needed</p></div>
+      <div class="card">
+        <div class="card-header">
+          <div style="display:flex;align-items:center;gap:12px;"><h3>Internal Emails</h3><span class="total-badge purple" id="internalTotalBadge">—</span></div>
+          <div style="display:flex;gap:8px;">
+            <select id="filterInternalAccount" onchange="loadInternal(1)"><option value="">All Accounts</option></select>
+            <button class="btn-refresh" onclick="loadInternal(1)">🔄 Refresh</button>
+          </div>
+        </div>
+        <div id="internalList"></div>
+        <div class="pagination" id="internalPagination"></div>
       </div>
     </div>
 
@@ -385,7 +403,7 @@ function showPage(page, el) {
   activeCharts.forEach(c => c.destroy()); activeCharts = [];
   if (page === 'unreplied') loadUnreplied(1);
   if (page === 'noreply') loadNoreply(1);
-  if (page === 'all') loadAll(1);
+  if (page === 'internal') loadInternal(1);
   if (page === 'weekly') loadWeekly();
   if (page === 'monthly') loadMonthly();
   if (page === 'admin') loadAdminUsers();
@@ -410,6 +428,7 @@ async function loadDashboard() {
   document.getElementById('statReplied').textContent = stats.replied;
   document.getElementById('statUnreplied').textContent = stats.unreplied;
   document.getElementById('statNoReply').textContent = stats.noReplyNeeded || '—';
+  document.getElementById('statInternal').textContent = stats.internal || '—';
 
   // Unreplied tab
   const data = await apiFetch('/api/emails/unreplied?limit=10');
@@ -450,6 +469,18 @@ async function loadNoreply(page = 1) {
     ? '<div class="empty">No auto-filtered emails.</div>'
     : renderEmailTable(data.emails, false, true);
   renderPagination('noreplyPagination', page, data.total, 20, loadNoreply);
+}
+
+async function loadInternal(page = 1) {
+  document.getElementById('internalList').innerHTML = '<div class="loading">Loading...</div>';
+  const account = document.getElementById('filterInternalAccount')?.value || '';
+  const data = await apiFetch(`/api/emails/internal?page=${page}&limit=20${account ? '&account='+account : ''}`);
+  if (!data) return;
+  document.getElementById('internalTotalBadge').textContent = data.total + ' emails';
+  document.getElementById('internalList').innerHTML = data.emails.length === 0
+    ? '<div class="empty">No internal emails found.</div>'
+    : renderEmailTable(data.emails, false, true);
+  renderPagination('internalPagination', page, data.total, 20, loadInternal);
 }
 
 async function loadAll(page = 1) {
