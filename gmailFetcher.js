@@ -79,22 +79,16 @@ async function fetchGmailEmails(accountEmail) {
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
   try {
-    // Paginate through ALL inbox emails for full historical backfill
-    // ignoreDuplicates=true means re-fetching existing emails is safe and fast
-    let messages = [];
-    let pageToken = undefined;
-    do {
-      const listRes = await gmail.users.messages.list({
-        userId: 'me',
-        maxResults: 500,
-        labelIds: ['INBOX', 'CATEGORY_PERSONAL'],
-        ...(pageToken ? { pageToken } : {})
-      });
-      const batch = listRes.data.messages || [];
-      messages = messages.concat(batch);
-      pageToken = listRes.data.nextPageToken;
-      // no cap — fetch all emails
-    } while (pageToken);
+    // Fetch only last 5 days of emails
+    const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
+    const after = Math.floor(fiveDaysAgo.getTime() / 1000);
+    const listRes = await gmail.users.messages.list({
+      userId: 'me',
+      maxResults: 500,
+      labelIds: ['INBOX', 'CATEGORY_PERSONAL'],
+      q: `after:${after}`
+    });
+    const messages = listRes.data.messages || [];
 
     console.log(`[Gmail] ${accountEmail}: ${messages.length} messages found`);
     let saved = 0;
@@ -410,4 +404,25 @@ async function runGmailFetcher() {
   console.log('[Gmail] Done.');
 }
 
-module.exports = { runGmailFetcher, saveTokenToSupabase, aiRescanExistingEmails };
+async function runReplyCheckOnly() {
+  const { data: users } = await supabase.from('users').select('email, gmail_token').not('gmail_token', 'is', null);
+  const envAccounts = (process.env.GMAIL_ACCOUNTS || '').split(',').map(e => e.trim()).filter(Boolean);
+  const allAccounts = [...new Set([...(users || []).map(u => u.email), ...envAccounts])];
+  if (!allAccounts.length) return;
+  console.log(`[Gmail] Reply-check-only for ${allAccounts.length} accounts`);
+  for (const account of allAccounts) {
+    const tokens = await getTokenFromSupabase(account);
+    if (!tokens) continue;
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID,
+      process.env.GMAIL_CLIENT_SECRET,
+      process.env.GMAIL_REDIRECT_URI
+    );
+    oauth2Client.setCredentials(tokens);
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    await checkGmailReplies(account, gmail);
+  }
+  console.log('[Gmail] Reply-check-only done.');
+}
+
+module.exports = { runGmailFetcher, saveTokenToSupabase, aiRescanExistingEmails, runReplyCheckOnly };
