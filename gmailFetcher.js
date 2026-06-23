@@ -310,23 +310,24 @@ async function checkGmailReplies(accountEmail, gmail) {
     if (!sentMessages.length) return;
 
     const threadIds = [];
-    const sentToEmails = []; // { email, sentAt }
+    const sentToEmails = []; // { email, sentAt, subject }
 
     for (const msg of sentMessages.slice(0, 500)) {
       const detail = await gmail.users.messages.get({
-        userId: 'me', id: msg.id, format: 'minimal'
+        userId: 'me', id: msg.id, format: 'metadata', metadataHeaders: ['To', 'Subject', 'Date']
       });
       const internalDate = parseInt(detail.data.internalDate || '0');
       if (internalDate > sinceMs && detail.data.threadId) {
         threadIds.push(detail.data.threadId);
 
-        // Also extract To: header for sender-based matching
-        const toHeader = (detail.data.payload?.headers || [])
-          .find(h => h.name === 'To')?.value || '';
-        // Extract all email addresses from To header
+        const headers = detail.data.payload?.headers || [];
+        const toHeader = headers.find(h => h.name === 'To')?.value || '';
+        const subjectHeader = headers.find(h => h.name === 'Subject')?.value || '';
+        const cleanSubject = subjectHeader.replace(/^(re|fw|fwd|sv|reg|vs|vb|ang|tr):\s*/gi, '').trim().toLowerCase();
+
         const emailMatches = toHeader.match(/[\w.-]+@[\w.-]+\.\w+/g) || [];
         for (const em of emailMatches) {
-          sentToEmails.push({ email: em.toLowerCase(), sentAt: internalDate });
+          sentToEmails.push({ email: em.toLowerCase(), sentAt: internalDate, subject: cleanSubject });
         }
       }
     }
@@ -355,7 +356,7 @@ async function checkGmailReplies(accountEmail, gmail) {
     if (sentToEmails.length) {
       const { data: unrepliedEmails } = await supabase
         .from('emails')
-        .select('id, sender_email, received_at')
+        .select('id, sender_email, received_at, subject')
         .eq('account', accountEmail)
         .eq('status', 'unreplied');
 
@@ -364,11 +365,14 @@ async function checkGmailReplies(accountEmail, gmail) {
         for (const email of unrepliedEmails) {
           const senderLower = (email.sender_email || '').toLowerCase();
           const receivedAt = new Date(email.received_at).getTime();
-          // Check if we sent an email TO this sender within 7 days of receiving their email
+          const emailSubject = (email.subject || '').replace(/^(re|fw|fwd|sv|reg|vs|vb|ang|tr):\s*/gi, '').trim().toLowerCase();
+
+          // Match: sent TO same person + same subject (ignoring RE/FW) within 7 days
           const replied = sentToEmails.some(sent =>
             sent.email === senderLower &&
             sent.sentAt > receivedAt &&
-            sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000
+            sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
+            (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
           );
           if (replied) toMarkReplied.push(email.id);
         }
