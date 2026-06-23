@@ -258,7 +258,12 @@ async function getAccountFilter(role, account_email, email) {
 // ─── STATS ───────────────────────────────────────────────────────
 app.get('/api/stats', authMiddleware, async (req, res) => {
   const { role, account_email, email } = req.user;
-  const today = new Date(); today.setHours(0, 0, 0, 0);
+  // IST = UTC+5:30, so IST midnight = UTC 18:30 previous day
+  const now = new Date();
+  const istOffset = 5.5 * 60 * 60 * 1000; // 5h30m in ms
+  const istNow = new Date(now.getTime() + istOffset);
+  const istMidnight = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
+  const today = new Date(istMidnight.getTime() - istOffset); // convert back to UTC
   const accountFilter = await getAccountFilter(role, account_email, email);
   if (!accountFilter.length) return res.json({ total: 0, replied: 0, unreplied: 0, today: 0, repliedToday: 0, noReplyNeeded: 0, internal: 0 });
   const [t, r, u, d, rd, nr, int_] = await Promise.all([
