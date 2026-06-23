@@ -383,6 +383,42 @@ async function checkGmailReplies(accountEmail, gmail) {
       }
     }
 
+    // ── Internal email reply matching ──
+    if (sentToEmails.length) {
+      const { data: internalEmails } = await supabase
+        .from('emails')
+        .select('id, sender_email, received_at, subject')
+        .eq('account', accountEmail)
+        .eq('status', 'internal')
+        .gte('received_at', new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString());
+
+      if (internalEmails?.length) {
+        const toMarkInternalReplied = [];
+        for (const email of internalEmails) {
+          const senderLower = (email.sender_email || '').toLowerCase();
+          const receivedAt = new Date(email.received_at).getTime();
+          const emailSubject = (email.subject || '').replace(/^(re|fw|fwd|sv|reg|vs|vb|ang|tr):\s*/gi, '').trim().toLowerCase();
+
+          const replied = sentToEmails.some(sent =>
+            sent.email === senderLower &&
+            sent.sentAt > receivedAt &&
+            sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
+            (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
+          );
+          if (replied) toMarkInternalReplied.push(email.id);
+        }
+
+        if (toMarkInternalReplied.length) {
+          await supabase.from('emails').update({
+            status: 'internal_replied',
+            replied_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          }).in('id', toMarkInternalReplied);
+          console.log(`[Gmail] ${accountEmail}: ${toMarkInternalReplied.length} internal emails marked replied`);
+        }
+      }
+    }
+
   } catch (err) {
     console.error(`[Gmail] Reply check error for ${accountEmail}:`, err.message);
   }
