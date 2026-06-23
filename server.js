@@ -8,7 +8,7 @@ const jwt = require('jsonwebtoken');
 const path = require('path');
 const { google } = require('googleapis');
 const { createClient } = require('@supabase/supabase-js');
-const { runGmailFetcher, saveTokenToSupabase, aiRescanExistingEmails } = require('./gmailFetcher');
+const { runGmailFetcher, saveTokenToSupabase, aiRescanExistingEmails, runReplyCheckOnly } = require('./gmailFetcher');
 const { sendDailyAgentReminders, sendDailyManagerReminders, sendWeeklyReports } = require('./reminderSender');
 
 const app = express();
@@ -404,6 +404,7 @@ app.post('/api/trigger/ai-rescan', authMiddleware, async (req, res) => {
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 cron.schedule('*/5 * * * *', () => runGmailFetcher().catch(console.error));
+cron.schedule('*/10 * * * *', () => runReplyCheckOnly().catch(console.error));
 cron.schedule('30 3 * * *', async () => { await sendDailyAgentReminders(); await sendDailyManagerReminders(); });
 cron.schedule('30 4 * * 6', () => sendWeeklyReports().catch(console.error));
 
