@@ -352,7 +352,8 @@ async function checkGmailReplies(accountEmail, gmail) {
         .from('emails')
         .select('id, sender_email, received_at, subject')
         .eq('account', accountEmail)
-        .eq('status', 'unreplied');
+        .eq('status', 'unreplied')
+        .gte('received_at', new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString());
 
       if (unrepliedEmails?.length) {
         const toMarkReplied = [];
