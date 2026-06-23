@@ -270,7 +270,7 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'replied'),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'unreplied'),
-    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).gte('received_at', today.toISOString()),
+    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).gte('received_at', today.toISOString()).in('status', ['unreplied', 'replied']),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'replied').gte('replied_at', today.toISOString()),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'no_reply_needed'),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'internal')
