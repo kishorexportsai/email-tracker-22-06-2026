@@ -310,6 +310,8 @@ async function checkGmailReplies(accountEmail, gmail) {
     if (!sentMessages.length) return;
 
     const threadIds = [];
+    const sentToEmails = []; // { email, sentAt }
+
     for (const msg of sentMessages.slice(0, 500)) {
       const detail = await gmail.users.messages.get({
         userId: 'me', id: msg.id, format: 'minimal'
@@ -317,27 +319,71 @@ async function checkGmailReplies(accountEmail, gmail) {
       const internalDate = parseInt(detail.data.internalDate || '0');
       if (internalDate > sinceMs && detail.data.threadId) {
         threadIds.push(detail.data.threadId);
+
+        // Also extract To: header for sender-based matching
+        const toHeader = (detail.data.payload?.headers || [])
+          .find(h => h.name === 'To')?.value || '';
+        // Extract all email addresses from To header
+        const emailMatches = toHeader.match(/[\w.-]+@[\w.-]+\.\w+/g) || [];
+        for (const em of emailMatches) {
+          sentToEmails.push({ email: em.toLowerCase(), sentAt: internalDate });
+        }
       }
     }
 
-    if (!threadIds.length) return;
+    // ── Thread ID matching (existing logic) ──
+    if (threadIds.length) {
+      const { data: unreplied } = await supabase
+        .from('emails')
+        .select('id')
+        .eq('account', accountEmail)
+        .eq('status', 'unreplied')
+        .in('thread_id', threadIds);
 
-    const { data: unreplied } = await supabase
-      .from('emails')
-      .select('id')
-      .eq('account', accountEmail)
-      .eq('status', 'unreplied')
-      .in('thread_id', threadIds);
-
-    if (unreplied?.length) {
-      const ids = unreplied.map(e => e.id);
-      await supabase.from('emails').update({
-        status: 'replied',
-        replied_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }).in('id', ids);
-      console.log(`[Gmail] ${accountEmail}: ${ids.length} marked as replied`);
+      if (unreplied?.length) {
+        const ids = unreplied.map(e => e.id);
+        await supabase.from('emails').update({
+          status: 'replied',
+          replied_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }).in('id', ids);
+        console.log(`[Gmail] ${accountEmail}: ${ids.length} marked replied via thread`);
+      }
     }
+
+    // ── Sender-based matching (new email replies) ──
+    if (sentToEmails.length) {
+      const { data: unrepliedEmails } = await supabase
+        .from('emails')
+        .select('id, sender_email, received_at')
+        .eq('account', accountEmail)
+        .eq('status', 'unreplied');
+
+      if (unrepliedEmails?.length) {
+        const toMarkReplied = [];
+        for (const email of unrepliedEmails) {
+          const senderLower = (email.sender_email || '').toLowerCase();
+          const receivedAt = new Date(email.received_at).getTime();
+          // Check if we sent an email TO this sender within 7 days of receiving their email
+          const replied = sentToEmails.some(sent =>
+            sent.email === senderLower &&
+            sent.sentAt > receivedAt &&
+            sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000
+          );
+          if (replied) toMarkReplied.push(email.id);
+        }
+
+        if (toMarkReplied.length) {
+          await supabase.from('emails').update({
+            status: 'replied',
+            replied_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          }).in('id', toMarkReplied);
+          console.log(`[Gmail] ${accountEmail}: ${toMarkReplied.length} marked replied via sender match`);
+        }
+      }
+    }
+
   } catch (err) {
     console.error(`[Gmail] Reply check error for ${accountEmail}:`, err.message);
   }
