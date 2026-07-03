@@ -1,10 +1,9 @@
-// backend/gmailFetcher.js - FINAL VERSION
-// Fixes:
-// 1. Detects notification-only, do-not-reply phrases in email body
-// 2. Catches ALL kishor* patterns (not just kishor.merchant)
-// 3. Added more system domains (ul.com, ftncv.com, banks, etc)
-// 4. Detects FYI/informational phrases
-// 5. Fixed token lookup to use account_email consistently
+// backend/gmailFetcher.js - FINAL (rate-limit hardened)
+// Changes from previous version:
+// 1. classifyEmailSafe() wraps classifyEmail with retry + exponential backoff on 429
+// 2. Delay between AI calls raised 4000ms -> 5000ms (12 RPM vs Gemini's 15 RPM cap, leaves margin)
+// 3. On repeated 429 after retries, falls through to existing safe default (status stays 'unreplied')
+//    instead of hammering the API pointlessly
 
 require('dotenv').config();
 const { google } = require('googleapis');
@@ -15,75 +14,37 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 
 // ── SYSTEM DOMAIN DETECTION ──────────────────────────────────────
 const OBVIOUS_SYSTEM_DOMAINS = [
-  // Tech/Cloud/Dev
   'railway.app', 'github.com', 'github.io', 'render.com', 'vercel.app',
   'google.com', 'accounts.google.com', 'googlemail.com',
-  // Social/Marketing
   'linkedin.com', 'twitter.com', 'facebook.com', 'instagram.com',
-  // Email services
   'mailchimp.com', 'sendgrid.net', 'amazonses.com', 'brevo.com',
-  // Banks (Indian + International)
   'hdfcbank.com', 'sbi.co.in', 'icicibank.com', 'axisbank.com',
   'kotak.com', 'yesbank.in', 'indusind.com', 'canarabank.com',
   'barodampbank.com', 'pnbindia.com',
-  // Payment/Finance
   'paytm.com', 'phonepe.com', 'razorpay.com', 'stripe.com', 'paypal.com',
-  // B2B/Directories
   'indiamart.com', 'tradeindia.com', 'alibaba.com',
-  // Dev/Hosting
   'apollo.io', 'vultr.com', 'anthropic.com', 'dyad.sh',
-  // Collab tools
   'zoom.us', 'slack.com', 'notion.so', 'asana.com', 'monday.com',
-  // Logistics/Shipping
   'dhl.com', 'fedex.com', 'ups.com', 'aramex.com', 'shiprocket.com',
-  // Quality/Compliance
   'ul.com', 'intertek.com', 'tuv.com', 'dnvgl.com',
-  // Industry networks
   'ftncv.com', 'napp.org', 'fairtrade.net',
 ];
 
-// ── NOTIFICATION-ONLY KEYWORDS ──────────────────────────────────
-// Phrases in email body that indicate: do NOT reply
 const DO_NOT_REPLY_KEYWORDS = [
-  'notification-only address',
-  'do not reply',
-  'do-not-reply',
-  'cannot accept incoming',
-  'no-reply',
-  'noreply',
-  'automated message',
-  'automated response',
-  'this is an automated',
-  'please do not respond',
-  'please do not reply',
-  'do not respond to this',
-  'mailer-daemon',
-  'postmaster',
-  'undeliverable',
-  'out of office',
+  'notification-only address', 'do not reply', 'do-not-reply',
+  'cannot accept incoming', 'no-reply', 'noreply',
+  'automated message', 'automated response', 'this is an automated',
+  'please do not respond', 'please do not reply', 'do not respond to this',
+  'mailer-daemon', 'postmaster', 'undeliverable', 'out of office',
 ];
 
-// ── FYI / INFORMATIONAL KEYWORDS ─────────────────────────────────
-// Phrases that suggest: email is for information only, no action needed
 const FYI_KEYWORDS = [
-  'for your information',
-  'for information only',
-  'for your reference',
-  'fyi',
-  'for awareness',
-  'please note',
-  'for your attention',
-  'inward team has already sent',
-  'already processed',
-  'already handled',
-  'in case you need',
-  'status update',
-  'information only',
-  'tracking update',
-  'shipment status',
-  'order confirmation',
-  'invoice attached',
-  'attached invoice',
+  'for your information', 'for information only', 'for your reference',
+  'fyi', 'for awareness', 'please note', 'for your attention',
+  'inward team has already sent', 'already processed', 'already handled',
+  'in case you need', 'status update', 'information only',
+  'tracking update', 'shipment status', 'order confirmation',
+  'invoice attached', 'attached invoice',
 ];
 
 const OBVIOUS_SYSTEM_KEYWORDS = [
@@ -94,51 +55,36 @@ const OBVIOUS_SYSTEM_KEYWORDS = [
 
 const GMAIL_LABELS_TO_SKIP = ['CATEGORY_PROMOTIONS', 'CATEGORY_UPDATES', 'CATEGORY_SOCIAL', 'SPAM'];
 
-// ── INTERNAL EMAIL DETECTION (IMPROVED) ──────────────────────────
 const INTERNAL_DOMAINS = ['kishorexports.com', 'kishorexports.ai'];
 
 function isInternalEmail(senderEmail, senderName) {
   const emailLower = (senderEmail || '').toLowerCase();
   const nameLower = (senderName || '').toLowerCase();
-  
-  // Check domain
   const domain = emailLower.split('@')[1] || '';
   if (INTERNAL_DOMAINS.some(d => domain.includes(d))) return true;
-  
-  // ✅ IMPROVED: Catch ANY email starting with kishor* or containing kishor.* patterns
   if (emailLower.includes('kishor')) return true;
   if (nameLower.includes('kishor')) return true;
-  
   return false;
 }
 
 function isObviouslySystem(senderEmail, labelIds, listUnsub) {
   if (listUnsub) return true;
   if (labelIds.some(l => GMAIL_LABELS_TO_SKIP.includes(l))) return true;
-  
   const lower = (senderEmail || '').toLowerCase();
   const domain = lower.split('@')[1] || '';
-  
   if (OBVIOUS_SYSTEM_DOMAINS.some(d => domain.includes(d))) return true;
   if (OBVIOUS_SYSTEM_KEYWORDS.some(k => lower.includes(k))) return true;
-  
   return false;
 }
 
-// ✅ NEW: Detect notification-only and FYI emails by scanning body text
 function detectByBodyContent(bodySnippet) {
   const lower = (bodySnippet || '').toLowerCase();
-  
-  // Check for do-not-reply phrases
   if (DO_NOT_REPLY_KEYWORDS.some(k => lower.includes(k))) {
     return { status: 'no_reply_needed', reason: 'Notification-only email (body text)' };
   }
-  
-  // Check for FYI/informational phrases
   if (FYI_KEYWORDS.some(k => lower.includes(k))) {
     return { status: 'no_reply_needed', reason: 'Informational email (for reference only)' };
   }
-  
   return null;
 }
 
@@ -146,34 +92,56 @@ function getHeader(headers, name) {
   return headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 }
 
-// ── TOKEN STORAGE (CONSISTENT FIELD) ─────────────────────────────
+// ── AI CALL WITH RETRY + BACKOFF (handles 429) ───────────────────
+async function classifyEmailSafe(params, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await classifyEmail(params);
+      return result;
+    } catch (err) {
+      const is429 = err?.status === 429 || err?.message?.includes('429');
+      const isLast = attempt === maxRetries;
+
+      if (!is429 || isLast) {
+        console.error(`[AI] Failed (attempt ${attempt + 1}/${maxRetries + 1}):`, err.message);
+        return null; // fall through to safe default (unreplied) at call site
+      }
+
+      // Exponential backoff: 5s, 10s, 20s
+      const backoffMs = 5000 * Math.pow(2, attempt);
+      console.log(`[AI] Rate limited (429). Retrying in ${backoffMs / 1000}s... (attempt ${attempt + 1}/${maxRetries})`);
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
+  }
+  return null;
+}
+
+// ── TOKEN STORAGE ─────────────────────────────────────────────────
 async function getTokenFromSupabase(accountEmail) {
-  // ✅ FIXED: Use account_email consistently (not email)
   const { data, error } = await supabase
     .from('users')
     .select('gmail_token')
     .eq('account_email', accountEmail)
     .single();
-  
+
   if (error || !data?.gmail_token) {
     console.log(`[Gmail] No token for ${accountEmail}`);
     return null;
   }
-  
+
   try {
     return typeof data.gmail_token === 'string' ? JSON.parse(data.gmail_token) : data.gmail_token;
-  } catch { 
-    return null; 
+  } catch {
+    return null;
   }
 }
 
 async function saveTokenToSupabase(accountEmail, tokens) {
-  // ✅ FIXED: Use account_email consistently
   const { error } = await supabase
     .from('users')
     .update({ gmail_token: JSON.stringify(tokens) })
     .eq('account_email', accountEmail);
-  
+
   if (error) console.error(`[Gmail] Failed to save token for ${accountEmail}:`, error.message);
 }
 
@@ -187,7 +155,7 @@ async function fetchGmailEmails(accountEmail) {
     process.env.GMAIL_CLIENT_SECRET,
     process.env.GMAIL_REDIRECT_URI
   );
-  
+
   oauth2Client.setCredentials(tokens);
   oauth2Client.on('tokens', async (newTokens) => {
     await saveTokenToSupabase(accountEmail, { ...tokens, ...newTokens });
@@ -199,17 +167,17 @@ async function fetchGmailEmails(accountEmail) {
   try {
     const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
     const after = Math.floor(fiveDaysAgo.getTime() / 1000);
-    
+
     const listRes = await gmail.users.messages.list({
       userId: 'me',
       maxResults: 500,
       labelIds: ['INBOX', 'CATEGORY_PERSONAL'],
       q: `after:${after}`
     });
-    
+
     const messages = listRes.data.messages || [];
     console.log(`[Gmail] ${accountEmail}: ${messages.length} messages found`);
-    
+
     let saved = 0;
 
     for (const msg of messages) {
@@ -237,27 +205,19 @@ async function fetchGmailEmails(accountEmail) {
       const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
       const isRecent = new Date(receivedAt).getTime() > fifteenDaysAgo;
 
-      // ── CLASSIFICATION FLOW ──────────────────────────────────────
-      
-      // Step 1: Check if internal
       const isInternal = isInternalEmail(senderEmail, senderName);
-      
-      // Step 2: Check BCC
+
       const accountLower = accountEmail.toLowerCase();
       const inTo = toHeader.toLowerCase().includes(accountLower);
       const inCc = ccHeader.toLowerCase().includes(accountLower);
       const isBcc = !inTo && !inCc;
-      
-      // Step 3: Check CC + Amit
+
       const isOnlyCc = !inTo && inCc;
       const bodySnippet = (detail.data.snippet || '').toLowerCase();
       const amitMentioned = bodySnippet.includes('amit');
       const ccNoAmit = isOnlyCc && !amitMentioned;
 
-      // Step 4: Check if obviously system
       const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub.length > 0);
-      
-      // ✅ NEW Step 5: Check email body for do-not-reply and FYI phrases
       const bodyDetection = detectByBodyContent(detail.data.snippet);
 
       let status = 'unreplied';
@@ -277,7 +237,6 @@ async function fetchGmailEmails(accountEmail) {
         aiReason = 'CC only and Amit not mentioned — FYI email';
         aiConfidence = 'high';
       } else if (bodyDetection) {
-        // ✅ NEW: Body-based detection (catches notification-only, FYI)
         status = bodyDetection.status;
         aiReason = bodyDetection.reason;
         aiConfidence = 'high';
@@ -286,9 +245,10 @@ async function fetchGmailEmails(accountEmail) {
         aiReason = 'Auto-detected: system/bulk/bank email';
         aiConfidence = 'high';
       } else if (isRecent) {
-        // Step 6: AI classification only for recent emails
-        const aiResult = await classifyEmail({
-          senderEmail, senderName, subject, 
+        // Only reaches here for genuinely ambiguous emails —
+        // everything else already resolved above
+        const aiResult = await classifyEmailSafe({
+          senderEmail, senderName, subject,
           bodyPreview: detail.data.snippet || '',
           toHeader, ccHeader, accountEmail
         });
@@ -298,8 +258,10 @@ async function fetchGmailEmails(accountEmail) {
           aiReason = aiResult.reason;
           aiConfidence = aiResult.confidence;
         }
-        
-        await new Promise(r => setTimeout(r, 4000));
+        // else: aiResult is null (failed after retries) -> stays 'unreplied', safe default
+
+        // 5s base delay = 12 RPM, under Gemini free tier's 15 RPM cap
+        await new Promise(r => setTimeout(r, 5000));
       }
 
       const emailData = {
@@ -319,7 +281,6 @@ async function fetchGmailEmails(accountEmail) {
         ai_confidence: aiConfidence,
       };
 
-      // ✅ FIXED: Removed ignoreDuplicates so existing emails are UPDATED
       const { error } = await supabase
         .from('emails')
         .upsert(emailData, { onConflict: 'email_id' });
@@ -377,8 +338,7 @@ async function aiRescanExistingEmails() {
       newReason = 'Auto-detected: system/bank email';
       newConfidence = 'high';
     } else {
-      // Only AI classify if still unreplied after all auto-checks
-      const aiResult = await classifyEmail({
+      const aiResult = await classifyEmailSafe({
         senderEmail: email.sender_email,
         senderName: email.sender_name,
         subject: email.subject,
@@ -394,7 +354,7 @@ async function aiRescanExistingEmails() {
         newConfidence = aiResult.confidence;
       }
 
-      await new Promise(r => setTimeout(r, 4000));
+      await new Promise(r => setTimeout(r, 5000));
     }
 
     if (newStatus !== email.status) {
@@ -408,7 +368,7 @@ async function aiRescanExistingEmails() {
           updated_at: new Date().toISOString()
         })
         .eq('id', email.id);
-      
+
       changed++;
       console.log(`  [${email.status} → ${newStatus}] ${email.subject.slice(0, 50)}`);
     }
@@ -459,7 +419,6 @@ async function checkGmailReplies(accountEmail, gmail) {
       }
     }
 
-    // Thread ID match
     if (threadIds.length) {
       const { data: unreplied } = await supabase
         .from('emails')
@@ -479,7 +438,6 @@ async function checkGmailReplies(accountEmail, gmail) {
       }
     }
 
-    // Sender match
     if (sentToEmails.length) {
       const { data: unrepliedEmails } = await supabase
         .from('emails')
@@ -501,7 +459,7 @@ async function checkGmailReplies(accountEmail, gmail) {
             sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
             (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
           );
-          
+
           if (replied) toMarkReplied.push(email.id);
         }
 
@@ -516,7 +474,6 @@ async function checkGmailReplies(accountEmail, gmail) {
       }
     }
 
-    // Internal email reply match
     if (sentToEmails.length) {
       const { data: internalEmails } = await supabase
         .from('emails')
@@ -538,7 +495,7 @@ async function checkGmailReplies(accountEmail, gmail) {
             sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
             (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
           );
-          
+
           if (replied) toMarkInternalReplied.push(email.id);
         }
 
@@ -586,6 +543,8 @@ async function runGmailFetcher() {
   }
 
   console.log(`[Gmail] Fetching ${allAccounts.length} accounts`);
+  // Sequential (not parallel) — keeps AI calls from stacking across accounts
+  // and hitting the rate limit even harder
   for (const account of allAccounts) {
     await fetchGmailEmails(account);
   }
@@ -620,7 +579,7 @@ async function runReplyCheckOnly() {
       process.env.GMAIL_CLIENT_SECRET,
       process.env.GMAIL_REDIRECT_URI
     );
-    
+
     oauth2Client.setCredentials(tokens);
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     await checkGmailReplies(account, gmail);
