@@ -1,4 +1,11 @@
-// backend/gmailFetcher.js
+// backend/gmailFetcher.js - FINAL VERSION
+// Fixes:
+// 1. Detects notification-only, do-not-reply phrases in email body
+// 2. Catches ALL kishor* patterns (not just kishor.merchant)
+// 3. Added more system domains (ul.com, ftncv.com, banks, etc)
+// 4. Detects FYI/informational phrases
+// 5. Fixed token lookup to use account_email consistently
+
 require('dotenv').config();
 const { google } = require('googleapis');
 const { createClient } = require('@supabase/supabase-js');
@@ -6,61 +13,171 @@ const { classifyEmail } = require('./aiClassifier');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ── QUICK PRE-FILTER (saves AI API calls for obvious junk) ────────
+// ── SYSTEM DOMAIN DETECTION ──────────────────────────────────────
 const OBVIOUS_SYSTEM_DOMAINS = [
-  'railway.app', 'github.com', 'github.io',
+  // Tech/Cloud/Dev
+  'railway.app', 'github.com', 'github.io', 'render.com', 'vercel.app',
   'google.com', 'accounts.google.com', 'googlemail.com',
+  // Social/Marketing
   'linkedin.com', 'twitter.com', 'facebook.com', 'instagram.com',
-  'mailchimp.com', 'sendgrid.net', 'amazonses.com',
+  // Email services
+  'mailchimp.com', 'sendgrid.net', 'amazonses.com', 'brevo.com',
+  // Banks (Indian + International)
   'hdfcbank.com', 'sbi.co.in', 'icicibank.com', 'axisbank.com',
-  'kotak.com', 'yesbank.in', 'paytm.com', 'phonepe.com',
+  'kotak.com', 'yesbank.in', 'indusind.com', 'canarabank.com',
+  'barodampbank.com', 'pnbindia.com',
+  // Payment/Finance
+  'paytm.com', 'phonepe.com', 'razorpay.com', 'stripe.com', 'paypal.com',
+  // B2B/Directories
   'indiamart.com', 'tradeindia.com', 'alibaba.com',
+  // Dev/Hosting
   'apollo.io', 'vultr.com', 'anthropic.com', 'dyad.sh',
-  'stripe.com', 'paypal.com', 'razorpay.com',
-  'zoom.us', 'slack.com', 'notion.so',
+  // Collab tools
+  'zoom.us', 'slack.com', 'notion.so', 'asana.com', 'monday.com',
+  // Logistics/Shipping
+  'dhl.com', 'fedex.com', 'ups.com', 'aramex.com', 'shiprocket.com',
+  // Quality/Compliance
+  'ul.com', 'intertek.com', 'tuv.com', 'dnvgl.com',
+  // Industry networks
+  'ftncv.com', 'napp.org', 'fairtrade.net',
+];
+
+// ── NOTIFICATION-ONLY KEYWORDS ──────────────────────────────────
+// Phrases in email body that indicate: do NOT reply
+const DO_NOT_REPLY_KEYWORDS = [
+  'notification-only address',
+  'do not reply',
+  'do-not-reply',
+  'cannot accept incoming',
+  'no-reply',
+  'noreply',
+  'automated message',
+  'automated response',
+  'this is an automated',
+  'please do not respond',
+  'please do not reply',
+  'do not respond to this',
+  'mailer-daemon',
+  'postmaster',
+  'undeliverable',
+  'out of office',
+];
+
+// ── FYI / INFORMATIONAL KEYWORDS ─────────────────────────────────
+// Phrases that suggest: email is for information only, no action needed
+const FYI_KEYWORDS = [
+  'for your information',
+  'for information only',
+  'for your reference',
+  'fyi',
+  'for awareness',
+  'please note',
+  'for your attention',
+  'inward team has already sent',
+  'already processed',
+  'already handled',
+  'in case you need',
+  'status update',
+  'information only',
+  'tracking update',
+  'shipment status',
+  'order confirmation',
+  'invoice attached',
+  'attached invoice',
 ];
 
 const OBVIOUS_SYSTEM_KEYWORDS = [
   'noreply', 'no-reply', 'donotreply', 'do-not-reply',
-  'mailer-daemon', 'postmaster',
+  'mailer-daemon', 'postmaster', 'billing', 'invoice', 'receipt',
+  'notification', 'alert', 'automated',
 ];
 
 const GMAIL_LABELS_TO_SKIP = ['CATEGORY_PROMOTIONS', 'CATEGORY_UPDATES', 'CATEGORY_SOCIAL', 'SPAM'];
 
+// ── INTERNAL EMAIL DETECTION (IMPROVED) ──────────────────────────
+const INTERNAL_DOMAINS = ['kishorexports.com', 'kishorexports.ai'];
+
+function isInternalEmail(senderEmail, senderName) {
+  const emailLower = (senderEmail || '').toLowerCase();
+  const nameLower = (senderName || '').toLowerCase();
+  
+  // Check domain
+  const domain = emailLower.split('@')[1] || '';
+  if (INTERNAL_DOMAINS.some(d => domain.includes(d))) return true;
+  
+  // ✅ IMPROVED: Catch ANY email starting with kishor* or containing kishor.* patterns
+  if (emailLower.includes('kishor')) return true;
+  if (nameLower.includes('kishor')) return true;
+  
+  return false;
+}
+
 function isObviouslySystem(senderEmail, labelIds, listUnsub) {
-  if (listUnsub) return true; // has List-Unsubscribe header = bulk mail
+  if (listUnsub) return true;
   if (labelIds.some(l => GMAIL_LABELS_TO_SKIP.includes(l))) return true;
+  
   const lower = (senderEmail || '').toLowerCase();
   const domain = lower.split('@')[1] || '';
+  
   if (OBVIOUS_SYSTEM_DOMAINS.some(d => domain.includes(d))) return true;
   if (OBVIOUS_SYSTEM_KEYWORDS.some(k => lower.includes(k))) return true;
+  
   return false;
+}
+
+// ✅ NEW: Detect notification-only and FYI emails by scanning body text
+function detectByBodyContent(bodySnippet) {
+  const lower = (bodySnippet || '').toLowerCase();
+  
+  // Check for do-not-reply phrases
+  if (DO_NOT_REPLY_KEYWORDS.some(k => lower.includes(k))) {
+    return { status: 'no_reply_needed', reason: 'Notification-only email (body text)' };
+  }
+  
+  // Check for FYI/informational phrases
+  if (FYI_KEYWORDS.some(k => lower.includes(k))) {
+    return { status: 'no_reply_needed', reason: 'Informational email (for reference only)' };
+  }
+  
+  return null;
 }
 
 function getHeader(headers, name) {
   return headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 }
 
-// ── TOKEN STORAGE ─────────────────────────────────────────────────
+// ── TOKEN STORAGE (CONSISTENT FIELD) ─────────────────────────────
 async function getTokenFromSupabase(accountEmail) {
+  // ✅ FIXED: Use account_email consistently (not email)
   const { data, error } = await supabase
-    .from('users').select('gmail_token').eq('email', accountEmail).single();
+    .from('users')
+    .select('gmail_token')
+    .eq('account_email', accountEmail)
+    .single();
+  
   if (error || !data?.gmail_token) {
     console.log(`[Gmail] No token for ${accountEmail}`);
     return null;
   }
+  
   try {
     return typeof data.gmail_token === 'string' ? JSON.parse(data.gmail_token) : data.gmail_token;
-  } catch { return null; }
+  } catch { 
+    return null; 
+  }
 }
 
 async function saveTokenToSupabase(accountEmail, tokens) {
+  // ✅ FIXED: Use account_email consistently
   const { error } = await supabase
-    .from('users').update({ gmail_token: JSON.stringify(tokens) }).eq('email', accountEmail);
+    .from('users')
+    .update({ gmail_token: JSON.stringify(tokens) })
+    .eq('account_email', accountEmail);
+  
   if (error) console.error(`[Gmail] Failed to save token for ${accountEmail}:`, error.message);
 }
 
-// ── FETCH EMAILS FOR ONE ACCOUNT ─────────────────────────────────
+// ── FETCH EMAILS ─────────────────────────────────────────────────
 async function fetchGmailEmails(accountEmail) {
   const tokens = await getTokenFromSupabase(accountEmail);
   if (!tokens) return 0;
@@ -70,6 +187,7 @@ async function fetchGmailEmails(accountEmail) {
     process.env.GMAIL_CLIENT_SECRET,
     process.env.GMAIL_REDIRECT_URI
   );
+  
   oauth2Client.setCredentials(tokens);
   oauth2Client.on('tokens', async (newTokens) => {
     await saveTokenToSupabase(accountEmail, { ...tokens, ...newTokens });
@@ -79,23 +197,26 @@ async function fetchGmailEmails(accountEmail) {
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
   try {
-    // Fetch only last 5 days of emails
     const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
     const after = Math.floor(fiveDaysAgo.getTime() / 1000);
+    
     const listRes = await gmail.users.messages.list({
       userId: 'me',
       maxResults: 500,
       labelIds: ['INBOX', 'CATEGORY_PERSONAL'],
       q: `after:${after}`
     });
+    
     const messages = listRes.data.messages || [];
-
     console.log(`[Gmail] ${accountEmail}: ${messages.length} messages found`);
+    
     let saved = 0;
 
     for (const msg of messages) {
       const detail = await gmail.users.messages.get({
-        userId: 'me', id: msg.id, format: 'metadata',
+        userId: 'me',
+        id: msg.id,
+        format: 'metadata',
         metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Date', 'Message-ID', 'List-Unsubscribe']
       });
 
@@ -113,34 +234,31 @@ async function fetchGmailEmails(accountEmail) {
       const senderName = from.replace(/<.+>/, '').trim().replace(/"/g, '');
 
       const receivedAt = date ? new Date(date).toISOString() : new Date().toISOString();
-
-      // Only AI-classify emails from the last 15 days
       const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
       const isRecent = new Date(receivedAt).getTime() > fifteenDaysAgo;
 
-      // ── INTERNAL EMAIL DETECTION ──────────────────────────────────
-      const INTERNAL_DOMAINS = ['kishorexports.com', 'kishorexports.ai'];
-      const INTERNAL_KEYWORDS = ['kishor.merchant', 'kishorexports', 'kishor.exports'];
-      const senderLower = senderEmail.toLowerCase();
-      const isInternal = INTERNAL_DOMAINS.some(d => senderLower.includes(d)) ||
-                         INTERNAL_KEYWORDS.some(k => senderLower.includes(k));
-
-      // ── BCC DETECTION ─────────────────────────────────────────────
-      // If our account email is NOT in To or CC, we were BCC'd → no reply needed
+      // ── CLASSIFICATION FLOW ──────────────────────────────────────
+      
+      // Step 1: Check if internal
+      const isInternal = isInternalEmail(senderEmail, senderName);
+      
+      // Step 2: Check BCC
       const accountLower = accountEmail.toLowerCase();
       const inTo = toHeader.toLowerCase().includes(accountLower);
       const inCc = ccHeader.toLowerCase().includes(accountLower);
       const isBcc = !inTo && !inCc;
-
-      // ── CC + AMIT CHECK ───────────────────────────────────────────
-      // If we're CC'd (not in To) and "amit" is not in the body snippet → no reply needed
+      
+      // Step 3: Check CC + Amit
       const isOnlyCc = !inTo && inCc;
       const bodySnippet = (detail.data.snippet || '').toLowerCase();
       const amitMentioned = bodySnippet.includes('amit');
       const ccNoAmit = isOnlyCc && !amitMentioned;
 
-      // Step 1: quick check for obvious system emails (no AI call needed)
+      // Step 4: Check if obviously system
       const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub.length > 0);
+      
+      // ✅ NEW Step 5: Check email body for do-not-reply and FYI phrases
+      const bodyDetection = detectByBodyContent(detail.data.snippet);
 
       let status = 'unreplied';
       let aiReason = null;
@@ -158,15 +276,20 @@ async function fetchGmailEmails(accountEmail) {
         status = 'no_reply_needed';
         aiReason = 'CC only and Amit not mentioned — FYI email';
         aiConfidence = 'high';
+      } else if (bodyDetection) {
+        // ✅ NEW: Body-based detection (catches notification-only, FYI)
+        status = bodyDetection.status;
+        aiReason = bodyDetection.reason;
+        aiConfidence = 'high';
       } else if (obviouslySystem) {
         status = 'no_reply_needed';
         aiReason = 'Auto-detected: system/bulk/bank email';
         aiConfidence = 'high';
       } else if (isRecent) {
-        // Step 2: AI classification only for last 15 days
-        const bodyPreview = detail.data.snippet || ''; // already in bodySnippet but kept for clarity
+        // Step 6: AI classification only for recent emails
         const aiResult = await classifyEmail({
-          senderEmail, senderName, subject, bodyPreview,
+          senderEmail, senderName, subject, 
+          bodyPreview: detail.data.snippet || '',
           toHeader, ccHeader, accountEmail
         });
 
@@ -175,11 +298,9 @@ async function fetchGmailEmails(accountEmail) {
           aiReason = aiResult.reason;
           aiConfidence = aiResult.confidence;
         }
-        // Rate limit: wait 4 seconds between Gemini calls (free tier = 15 RPM)
+        
         await new Promise(r => setTimeout(r, 4000));
-        // if AI fails → default stays 'unreplied' (safe fallback)
       }
-      // older than 15 days → save as 'unreplied' without AI (you can review manually)
 
       const emailData = {
         email_id: msg.id,
@@ -198,14 +319,15 @@ async function fetchGmailEmails(accountEmail) {
         ai_confidence: aiConfidence,
       };
 
+      // ✅ FIXED: Removed ignoreDuplicates so existing emails are UPDATED
       const { error } = await supabase
         .from('emails')
-        .upsert(emailData, { onConflict: 'email_id', ignoreDuplicates: true });
+        .upsert(emailData, { onConflict: 'email_id' });
 
       if (!error) saved++;
     }
 
-    console.log(`[Gmail] ${accountEmail}: ${saved} saved`);
+    console.log(`[Gmail] ${accountEmail}: ${saved} saved/updated`);
     await checkGmailReplies(accountEmail, gmail);
     return saved;
 
@@ -215,43 +337,47 @@ async function fetchGmailEmails(accountEmail) {
   }
 }
 
-// ── AI RESCAN: re-classify existing emails ────────────────────────
+// ── AI RESCAN ────────────────────────────────────────────────────
 async function aiRescanExistingEmails() {
   console.log('[AI Rescan] Starting bulk re-classification...');
 
   const { data: emails, error } = await supabase
     .from('emails')
-    .select('id, sender_email, sender_name, subject, body_preview, account')
+    .select('id, sender_email, sender_name, subject, body_preview, account, status')
     .eq('status', 'unreplied')
     .order('received_at', { ascending: false });
 
   if (error || !emails?.length) {
-    console.log('[AI Rescan] No unreplied emails found or error:', error?.message);
+    console.log('[AI Rescan] No unreplied emails found');
     return { scanned: 0, changed: 0 };
   }
 
-  console.log(`[AI Rescan] Scanning ${emails.length} emails...`);
+  console.log(`[AI Rescan] Processing ${emails.length} unreplied emails...`);
   let changed = 0;
 
   for (const email of emails) {
+    const isInternal = isInternalEmail(email.sender_email, email.sender_name);
     const obviouslySystem = isObviouslySystem(email.sender_email, [], false);
-    const senderLower = (email.sender_email || '').toLowerCase();
-    const isInternalEmail = ['kishorexports.com', 'kishorexports.ai'].some(d => senderLower.includes(d)) ||
-                            ['kishor.merchant', 'kishorexports', 'kishor.exports'].some(k => senderLower.includes(k));
+    const bodyDetection = detectByBodyContent(email.body_preview);
 
-    let status = 'unreplied';
-    let aiReason = null;
-    let aiConfidence = null;
+    let newStatus = 'unreplied';
+    let newReason = null;
+    let newConfidence = null;
 
-    if (isInternalEmail) {
-      status = 'internal';
-      aiReason = 'Internal Kishor email';
-      aiConfidence = 'high';
+    if (isInternal) {
+      newStatus = 'internal';
+      newReason = 'Internal Kishor email';
+      newConfidence = 'high';
+    } else if (bodyDetection) {
+      newStatus = bodyDetection.status;
+      newReason = bodyDetection.reason;
+      newConfidence = 'high';
     } else if (obviouslySystem) {
-      status = 'no_reply_needed';
-      aiReason = 'Auto-detected: system/bulk/bank email';
-      aiConfidence = 'high';
+      newStatus = 'no_reply_needed';
+      newReason = 'Auto-detected: system/bank email';
+      newConfidence = 'high';
     } else {
+      // Only AI classify if still unreplied after all auto-checks
       const aiResult = await classifyEmail({
         senderEmail: email.sender_email,
         senderName: email.sender_name,
@@ -263,53 +389,60 @@ async function aiRescanExistingEmails() {
       });
 
       if (aiResult && !aiResult.needs_reply) {
-        status = 'no_reply_needed';
-        aiReason = aiResult.reason;
-        aiConfidence = aiResult.confidence;
+        newStatus = 'no_reply_needed';
+        newReason = aiResult.reason;
+        newConfidence = aiResult.confidence;
       }
-      // Rate limit: 4s delay between Gemini calls
+
       await new Promise(r => setTimeout(r, 4000));
     }
 
-    if (status === 'no_reply_needed' || status === 'internal') {
+    if (newStatus !== email.status) {
       await supabase
         .from('emails')
         .update({
-          status: status,
-          is_system_generated: status === 'no_reply_needed',
-          ai_reason: aiReason,
-          ai_confidence: aiConfidence,
+          status: newStatus,
+          is_system_generated: newStatus === 'no_reply_needed',
+          ai_reason: newReason,
+          ai_confidence: newConfidence,
           updated_at: new Date().toISOString()
         })
         .eq('id', email.id);
+      
       changed++;
+      console.log(`  [${email.status} → ${newStatus}] ${email.subject.slice(0, 50)}`);
     }
-
   }
 
-  console.log(`[AI Rescan] Done. ${changed}/${emails.length} reclassified as no_reply_needed`);
+  console.log(`[AI Rescan] Done. ${changed}/${emails.length} reclassified`);
   return { scanned: emails.length, changed };
 }
 
-// ── CHECK REPLIES ─────────────────────────────────────────────────
+// ── CHECK REPLIES ────────────────────────────────────────────────
 async function checkGmailReplies(accountEmail, gmail) {
   try {
-    const sinceMs = Date.now() - 60 * 24 * 60 * 60 * 1000; // 60 days
+    const sinceMs = Date.now() - 60 * 24 * 60 * 60 * 1000;
 
     const sentRes = await gmail.users.messages.list({
-      userId: 'me', maxResults: 500, labelIds: ['SENT'],
+      userId: 'me',
+      maxResults: 500,
+      labelIds: ['SENT'],
     });
 
     const sentMessages = sentRes.data.messages || [];
     if (!sentMessages.length) return;
 
     const threadIds = [];
-    const sentToEmails = []; // { email, sentAt, subject }
+    const sentToEmails = [];
 
     for (const msg of sentMessages.slice(0, 500)) {
       const detail = await gmail.users.messages.get({
-        userId: 'me', id: msg.id, format: 'metadata', metadataHeaders: ['To', 'Subject', 'Date']
+        userId: 'me',
+        id: msg.id,
+        format: 'metadata',
+        metadataHeaders: ['To', 'Subject', 'Date']
       });
+
       const internalDate = parseInt(detail.data.internalDate || '0');
       if (internalDate > sinceMs && detail.data.threadId) {
         threadIds.push(detail.data.threadId);
@@ -326,7 +459,7 @@ async function checkGmailReplies(accountEmail, gmail) {
       }
     }
 
-    // ── Thread ID matching (existing logic) ──
+    // Thread ID match
     if (threadIds.length) {
       const { data: unreplied } = await supabase
         .from('emails')
@@ -342,11 +475,11 @@ async function checkGmailReplies(accountEmail, gmail) {
           replied_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         }).in('id', ids);
-        console.log(`[Gmail] ${accountEmail}: ${ids.length} marked replied via thread`);
+        console.log(`[Gmail] ${accountEmail}: ${ids.length} marked replied (thread match)`);
       }
     }
 
-    // ── Sender-based matching (new email replies) ──
+    // Sender match
     if (sentToEmails.length) {
       const { data: unrepliedEmails } = await supabase
         .from('emails')
@@ -362,13 +495,13 @@ async function checkGmailReplies(accountEmail, gmail) {
           const receivedAt = new Date(email.received_at).getTime();
           const emailSubject = (email.subject || '').replace(/^(re|fw|fwd|sv|reg|vs|vb|ang|tr):\s*/gi, '').trim().toLowerCase();
 
-          // Match: sent TO same person + same subject (ignoring RE/FW) within 7 days
           const replied = sentToEmails.some(sent =>
             sent.email === senderLower &&
             sent.sentAt > receivedAt &&
             sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
             (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
           );
+          
           if (replied) toMarkReplied.push(email.id);
         }
 
@@ -378,12 +511,12 @@ async function checkGmailReplies(accountEmail, gmail) {
             replied_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
           }).in('id', toMarkReplied);
-          console.log(`[Gmail] ${accountEmail}: ${toMarkReplied.length} marked replied via sender match`);
+          console.log(`[Gmail] ${accountEmail}: ${toMarkReplied.length} marked replied (sender match)`);
         }
       }
     }
 
-    // ── Internal email reply matching ──
+    // Internal email reply match
     if (sentToEmails.length) {
       const { data: internalEmails } = await supabase
         .from('emails')
@@ -405,6 +538,7 @@ async function checkGmailReplies(accountEmail, gmail) {
             sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
             (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
           );
+          
           if (replied) toMarkInternalReplied.push(email.id);
         }
 
@@ -424,37 +558,69 @@ async function checkGmailReplies(accountEmail, gmail) {
   }
 }
 
-// ── MAIN ──────────────────────────────────────────────────────────
+// ── MAIN ─────────────────────────────────────────────────────────
 async function runGmailFetcher() {
   const { data: users, error } = await supabase
-    .from('users').select('email, gmail_token').not('gmail_token', 'is', null);
+    .from('users')
+    .select('account_email, gmail_token')
+    .not('gmail_token', 'is', null);
 
-  if (error) { console.error('[Gmail] Supabase error:', error.message); return; }
+  if (error) {
+    console.error('[Gmail] Supabase error:', error.message);
+    return;
+  }
 
-  const envAccounts = (process.env.GMAIL_ACCOUNTS || '').split(',').map(e => e.trim()).filter(Boolean);
-  const allAccounts = [...new Set([...(users || []).map(u => u.email), ...envAccounts])];
+  const envAccounts = (process.env.GMAIL_ACCOUNTS || '')
+    .split(',')
+    .map(e => e.trim())
+    .filter(Boolean);
 
-  if (!allAccounts.length) { console.log('[Gmail] No connected accounts'); return; }
+  const allAccounts = [...new Set([
+    ...(users || []).map(u => u.account_email),
+    ...envAccounts
+  ])];
+
+  if (!allAccounts.length) {
+    console.log('[Gmail] No connected accounts');
+    return;
+  }
 
   console.log(`[Gmail] Fetching ${allAccounts.length} accounts`);
-  for (const account of allAccounts) await fetchGmailEmails(account);
+  for (const account of allAccounts) {
+    await fetchGmailEmails(account);
+  }
   console.log('[Gmail] Done.');
 }
 
 async function runReplyCheckOnly() {
-  const { data: users } = await supabase.from('users').select('email, gmail_token').not('gmail_token', 'is', null);
-  const envAccounts = (process.env.GMAIL_ACCOUNTS || '').split(',').map(e => e.trim()).filter(Boolean);
-  const allAccounts = [...new Set([...(users || []).map(u => u.email), ...envAccounts])];
+  const { data: users } = await supabase
+    .from('users')
+    .select('account_email, gmail_token')
+    .not('gmail_token', 'is', null);
+
+  const envAccounts = (process.env.GMAIL_ACCOUNTS || '')
+    .split(',')
+    .map(e => e.trim())
+    .filter(Boolean);
+
+  const allAccounts = [...new Set([
+    ...(users || []).map(u => u.account_email),
+    ...envAccounts
+  ])];
+
   if (!allAccounts.length) return;
+
   console.log(`[Gmail] Reply-check-only for ${allAccounts.length} accounts`);
   for (const account of allAccounts) {
     const tokens = await getTokenFromSupabase(account);
     if (!tokens) continue;
+
     const oauth2Client = new google.auth.OAuth2(
       process.env.GMAIL_CLIENT_ID,
       process.env.GMAIL_CLIENT_SECRET,
       process.env.GMAIL_REDIRECT_URI
     );
+    
     oauth2Client.setCredentials(tokens);
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     await checkGmailReplies(account, gmail);
