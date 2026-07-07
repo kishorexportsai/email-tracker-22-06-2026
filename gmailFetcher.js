@@ -1,9 +1,23 @@
-// backend/gmailFetcher.js - FINAL (rate-limit hardened)
-// Changes from previous version:
-// 1. classifyEmailSafe() wraps classifyEmail with retry + exponential backoff on 429
-// 2. Delay between AI calls raised 4000ms -> 5000ms (12 RPM vs Gemini's 15 RPM cap, leaves margin)
-// 3. On repeated 429 after retries, falls through to existing safe default (status stays 'unreplied')
-//    instead of hammering the API pointlessly
+// backend/gmailFetcher.js - BUYER-ALLOWLIST + INTERNAL-PATTERN VERSION
+//
+// Two independent, DB-configurable lists (see migration_domain_tables.sql):
+//   tracked_buyer_domains  -> strict domain equality. Drives buyer unreplied/reminders/KPIs.
+//   internal_identifiers   -> substring match against email+name. Drives Internal Mails tab.
+//                             Kept as substring (not domain-only) because real internal senders
+//                             include gmail.com accounts like kishor.merchant24@gmail.com —
+//                             a domain-only table would miss those entirely.
+//
+// Any email whose sender matches NEITHER list is not inserted into the emails table at all.
+// This is intentional: buyer tracking is scoped to known accounts, onboarding a new buyer
+// means adding a row to tracked_buyer_domains, not a code change.
+//
+// Still retained from prior fixes:
+//   - 48h rolling fetch window (survives extended outages, not just cold-start spin-down)
+//   - skip-if-exists dedup before any classification/AI/insert work
+//   - reply-check scoped to status='unreplied' rows only, one thread.get() per pending row
+//     (no bulk 500-message SENT scan)
+//   - AI classification only reached for buyer-domain emails that aren't already resolved
+//     by BCC/CC/body-detection/system-domain checks — retry+backoff on 429
 
 require('dotenv').config();
 const { google } = require('googleapis');
@@ -12,7 +26,8 @@ const { classifyEmail } = require('./aiClassifier');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ── SYSTEM DOMAIN DETECTION ──────────────────────────────────────
+// ── SYSTEM/NOISE DETECTION (still applies within buyer-domain mail —
+//    a buyer's own automated notification should still route to no_reply_needed) ──
 const OBVIOUS_SYSTEM_DOMAINS = [
   'railway.app', 'github.com', 'github.io', 'render.com', 'vercel.app',
   'google.com', 'accounts.google.com', 'googlemail.com',
@@ -55,18 +70,6 @@ const OBVIOUS_SYSTEM_KEYWORDS = [
 
 const GMAIL_LABELS_TO_SKIP = ['CATEGORY_PROMOTIONS', 'CATEGORY_UPDATES', 'CATEGORY_SOCIAL', 'SPAM'];
 
-const INTERNAL_DOMAINS = ['kishorexports.com', 'kishorexports.ai'];
-
-function isInternalEmail(senderEmail, senderName) {
-  const emailLower = (senderEmail || '').toLowerCase();
-  const nameLower = (senderName || '').toLowerCase();
-  const domain = emailLower.split('@')[1] || '';
-  if (INTERNAL_DOMAINS.some(d => domain.includes(d))) return true;
-  if (emailLower.includes('kishor')) return true;
-  if (nameLower.includes('kishor')) return true;
-  return false;
-}
-
 function isObviouslySystem(senderEmail, labelIds, listUnsub) {
   if (listUnsub) return true;
   if (labelIds.some(l => GMAIL_LABELS_TO_SKIP.includes(l))) return true;
@@ -92,24 +95,57 @@ function getHeader(headers, name) {
   return headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 }
 
-// ── AI CALL WITH RETRY + BACKOFF (handles 429) ───────────────────
+// ── LOAD THE TWO CONFIGURABLE LISTS (once per run, not per message/account) ──
+async function loadDomainConfig() {
+  const [buyerRes, internalRes] = await Promise.all([
+    supabase.from('tracked_buyer_domains').select('domain').eq('active', true),
+    supabase.from('internal_identifiers').select('pattern').eq('active', true),
+  ]);
+
+  if (buyerRes.error) {
+    console.error('[Config] Failed to load tracked_buyer_domains:', buyerRes.error.message);
+  }
+  if (internalRes.error) {
+    console.error('[Config] Failed to load internal_identifiers:', internalRes.error.message);
+  }
+
+  const buyerDomains = new Set((buyerRes.data || []).map(r => r.domain.toLowerCase()));
+  const internalPatterns = (internalRes.data || []).map(r => r.pattern.toLowerCase());
+
+  if (buyerDomains.size === 0) {
+    console.warn('[Config] WARNING: tracked_buyer_domains is empty — no buyer emails will be tracked this cycle.');
+  }
+  if (internalPatterns.length === 0) {
+    console.warn('[Config] WARNING: internal_identifiers is empty — Internal Mails tab will get nothing this cycle.');
+  }
+
+  return { buyerDomains, internalPatterns };
+}
+
+function isInternalEmail(senderEmail, senderName, internalPatterns) {
+  const emailLower = (senderEmail || '').toLowerCase();
+  const nameLower = (senderName || '').toLowerCase();
+  return internalPatterns.some(p => emailLower.includes(p) || nameLower.includes(p));
+}
+
+function isBuyerDomain(senderEmail, buyerDomains) {
+  const domain = (senderEmail || '').toLowerCase().split('@')[1] || '';
+  return buyerDomains.has(domain);
+}
+
 async function classifyEmailSafe(params, maxRetries = 3) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const result = await classifyEmail(params);
-      return result;
+      return await classifyEmail(params);
     } catch (err) {
       const is429 = err?.status === 429 || err?.message?.includes('429');
       const isLast = attempt === maxRetries;
-
       if (!is429 || isLast) {
-        console.error(`[AI] Failed (attempt ${attempt + 1}/${maxRetries + 1}):`, err.message);
-        return null; // fall through to safe default (unreplied) at call site
+        console.error(`[AI] Failed (attempt ${attempt + 1}):`, err.message);
+        return null;
       }
-
-      // Exponential backoff: 5s, 10s, 20s
       const backoffMs = 5000 * Math.pow(2, attempt);
-      console.log(`[AI] Rate limited (429). Retrying in ${backoffMs / 1000}s... (attempt ${attempt + 1}/${maxRetries})`);
+      console.log(`[AI] Rate limited. Retrying in ${backoffMs / 1000}s...`);
       await new Promise(r => setTimeout(r, backoffMs));
     }
   }
@@ -141,12 +177,13 @@ async function saveTokenToSupabase(accountEmail, tokens) {
     .from('users')
     .update({ gmail_token: JSON.stringify(tokens) })
     .eq('account_email', accountEmail);
-
   if (error) console.error(`[Gmail] Failed to save token for ${accountEmail}:`, error.message);
 }
 
-// ── FETCH EMAILS ─────────────────────────────────────────────────
-async function fetchGmailEmails(accountEmail) {
+// ── FETCH: buyer domains + internal patterns, everything else ignored ──
+async function fetchGmailEmails(accountEmail, domainConfig) {
+  const { buyerDomains, internalPatterns } = domainConfig;
+
   const tokens = await getTokenFromSupabase(accountEmail);
   if (!tokens) return 0;
 
@@ -165,22 +202,46 @@ async function fetchGmailEmails(accountEmail) {
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
   try {
-    const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
-    const after = Math.floor(fiveDaysAgo.getTime() / 1000);
+    // 48h window — survives extended outages (deploy failures, quota blocks),
+    // not just brief cold-start spin-downs. Still has a hard ceiling beyond 48h;
+    // historyId-based incremental sync would remove that ceiling entirely if ever needed.
+    const windowStart = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    const after = Math.floor(windowStart.getTime() / 1000);
 
+    // NOT narrowing this query to from:(buyer domains) server-side — Gmail's from:
+    // operator behavior on substring internal patterns isn't reliably documented,
+    // and mixing exact-domain (buyer) with substring (internal) filters in one query
+    // risks silent gaps. Filtering happens client-side after listing instead.
     const listRes = await gmail.users.messages.list({
       userId: 'me',
-      maxResults: 500,
+      maxResults: 300,
       labelIds: ['INBOX', 'CATEGORY_PERSONAL'],
       q: `after:${after}`
     });
 
     const messages = listRes.data.messages || [];
-    console.log(`[Gmail] ${accountEmail}: ${messages.length} messages found`);
+    console.log(`[Gmail] ${accountEmail}: ${messages.length} messages in 48h window`);
+
+    if (!messages.length) return 0;
+
+    // Skip-if-exists: batched check before any per-message work
+    const messageIds = messages.map(m => m.id);
+    const { data: existing } = await supabase
+      .from('emails')
+      .select('email_id')
+      .in('email_id', messageIds);
+
+    const existingIds = new Set((existing || []).map(e => e.email_id));
+    const newMessages = messages.filter(m => !existingIds.has(m.id));
+
+    console.log(`[Gmail] ${accountEmail}: ${newMessages.length} new, ${existingIds.size} already saved (skipped)`);
+
+    if (!newMessages.length) return 0;
 
     let saved = 0;
+    let ignoredNonTracked = 0;
 
-    for (const msg of messages) {
+    for (const msg of newMessages) {
       const detail = await gmail.users.messages.get({
         userId: 'me',
         id: msg.id,
@@ -200,68 +261,74 @@ async function fetchGmailEmails(accountEmail) {
       const emailMatch = from.match(/<(.+)>/);
       const senderEmail = emailMatch ? emailMatch[1] : from;
       const senderName = from.replace(/<.+>/, '').trim().replace(/"/g, '');
-
       const receivedAt = date ? new Date(date).toISOString() : new Date().toISOString();
-      const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
-      const isRecent = new Date(receivedAt).getTime() > fifteenDaysAgo;
 
-      const isInternal = isInternalEmail(senderEmail, senderName);
+      // ── GATE: must match internal pattern OR buyer domain, else fully ignored ──
+      const isInternal = isInternalEmail(senderEmail, senderName, internalPatterns);
+      const isBuyer = !isInternal && isBuyerDomain(senderEmail, buyerDomains);
 
-      const accountLower = accountEmail.toLowerCase();
-      const inTo = toHeader.toLowerCase().includes(accountLower);
-      const inCc = ccHeader.toLowerCase().includes(accountLower);
-      const isBcc = !inTo && !inCc;
+      if (!isInternal && !isBuyer) {
+        ignoredNonTracked++;
+        continue; // not inserted at all — not a buyer, not internal
+      }
 
-      const isOnlyCc = !inTo && inCc;
-      const bodySnippet = (detail.data.snippet || '').toLowerCase();
-      const amitMentioned = bodySnippet.includes('amit');
-      const ccNoAmit = isOnlyCc && !amitMentioned;
-
-      const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub.length > 0);
-      const bodyDetection = detectByBodyContent(detail.data.snippet);
-
-      let status = 'unreplied';
+      let status;
       let aiReason = null;
       let aiConfidence = null;
 
       if (isInternal) {
         status = 'internal';
-        aiReason = 'Internal Kishor email';
+        aiReason = 'Internal identifier match';
         aiConfidence = 'high';
-      } else if (isBcc) {
-        status = 'no_reply_needed';
-        aiReason = 'BCC only — no reply needed';
-        aiConfidence = 'high';
-      } else if (ccNoAmit) {
-        status = 'no_reply_needed';
-        aiReason = 'CC only and Amit not mentioned — FYI email';
-        aiConfidence = 'high';
-      } else if (bodyDetection) {
-        status = bodyDetection.status;
-        aiReason = bodyDetection.reason;
-        aiConfidence = 'high';
-      } else if (obviouslySystem) {
-        status = 'no_reply_needed';
-        aiReason = 'Auto-detected: system/bulk/bank email';
-        aiConfidence = 'high';
-      } else if (isRecent) {
-        // Only reaches here for genuinely ambiguous emails —
-        // everything else already resolved above
-        const aiResult = await classifyEmailSafe({
-          senderEmail, senderName, subject,
-          bodyPreview: detail.data.snippet || '',
-          toHeader, ccHeader, accountEmail
-        });
+      } else {
+        // Buyer-domain email — still run noise checks, a buyer's own
+        // automated system mail shouldn't count as a pending reply
+        const accountLower = accountEmail.toLowerCase();
+        const inTo = toHeader.toLowerCase().includes(accountLower);
+        const inCc = ccHeader.toLowerCase().includes(accountLower);
+        const isBcc = !inTo && !inCc;
 
-        if (aiResult) {
-          status = aiResult.needs_reply ? 'unreplied' : 'no_reply_needed';
-          aiReason = aiResult.reason;
-          aiConfidence = aiResult.confidence;
+        const isOnlyCc = !inTo && inCc;
+        const bodySnippet = (detail.data.snippet || '').toLowerCase();
+        const amitMentioned = bodySnippet.includes('amit');
+        const ccNoAmit = isOnlyCc && !amitMentioned;
+
+        const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub.length > 0);
+        const bodyDetection = detectByBodyContent(detail.data.snippet);
+
+        status = 'unreplied';
+
+        if (isBcc) {
+          status = 'no_reply_needed';
+          aiReason = 'BCC only — no reply needed';
+          aiConfidence = 'high';
+        } else if (ccNoAmit) {
+          status = 'no_reply_needed';
+          aiReason = 'CC only and Amit not mentioned — FYI email';
+          aiConfidence = 'high';
+        } else if (bodyDetection) {
+          status = bodyDetection.status;
+          aiReason = bodyDetection.reason;
+          aiConfidence = 'high';
+        } else if (obviouslySystem) {
+          status = 'no_reply_needed';
+          aiReason = 'Auto-detected: system/bulk email';
+          aiConfidence = 'high';
+        } else {
+          const aiResult = await classifyEmailSafe({
+            senderEmail, senderName, subject,
+            bodyPreview: detail.data.snippet || '',
+            toHeader, ccHeader, accountEmail
+          });
+
+          if (aiResult) {
+            status = aiResult.needs_reply ? 'unreplied' : 'no_reply_needed';
+            aiReason = aiResult.reason;
+            aiConfidence = aiResult.confidence;
+          }
+
+          await new Promise(r => setTimeout(r, 5000)); // 12 RPM, under Gemini's 15 RPM cap
         }
-        // else: aiResult is null (failed after retries) -> stays 'unreplied', safe default
-
-        // 5s base delay = 12 RPM, under Gemini free tier's 15 RPM cap
-        await new Promise(r => setTimeout(r, 5000));
       }
 
       const emailData = {
@@ -281,15 +348,12 @@ async function fetchGmailEmails(accountEmail) {
         ai_confidence: aiConfidence,
       };
 
-      const { error } = await supabase
-        .from('emails')
-        .upsert(emailData, { onConflict: 'email_id' });
-
+      const { error } = await supabase.from('emails').insert(emailData);
       if (!error) saved++;
+      else console.error(`[Gmail] Insert error for ${msg.id}:`, error.message);
     }
 
-    console.log(`[Gmail] ${accountEmail}: ${saved} saved/updated`);
-    await checkGmailReplies(accountEmail, gmail);
+    console.log(`[Gmail] ${accountEmail}: ${saved} saved (buyer+internal), ${ignoredNonTracked} ignored (untracked domain)`);
     return saved;
 
   } catch (err) {
@@ -298,216 +362,65 @@ async function fetchGmailEmails(accountEmail) {
   }
 }
 
-// ── AI RESCAN ────────────────────────────────────────────────────
-async function aiRescanExistingEmails() {
-  console.log('[AI Rescan] Starting bulk re-classification...');
-
-  const { data: emails, error } = await supabase
-    .from('emails')
-    .select('id, sender_email, sender_name, subject, body_preview, account, status')
-    .eq('status', 'unreplied')
-    .order('received_at', { ascending: false });
-
-  if (error || !emails?.length) {
-    console.log('[AI Rescan] No unreplied emails found');
-    return { scanned: 0, changed: 0 };
-  }
-
-  console.log(`[AI Rescan] Processing ${emails.length} unreplied emails...`);
-  let changed = 0;
-
-  for (const email of emails) {
-    const isInternal = isInternalEmail(email.sender_email, email.sender_name);
-    const obviouslySystem = isObviouslySystem(email.sender_email, [], false);
-    const bodyDetection = detectByBodyContent(email.body_preview);
-
-    let newStatus = 'unreplied';
-    let newReason = null;
-    let newConfidence = null;
-
-    if (isInternal) {
-      newStatus = 'internal';
-      newReason = 'Internal Kishor email';
-      newConfidence = 'high';
-    } else if (bodyDetection) {
-      newStatus = bodyDetection.status;
-      newReason = bodyDetection.reason;
-      newConfidence = 'high';
-    } else if (obviouslySystem) {
-      newStatus = 'no_reply_needed';
-      newReason = 'Auto-detected: system/bank email';
-      newConfidence = 'high';
-    } else {
-      const aiResult = await classifyEmailSafe({
-        senderEmail: email.sender_email,
-        senderName: email.sender_name,
-        subject: email.subject,
-        bodyPreview: email.body_preview,
-        toHeader: '',
-        ccHeader: '',
-        accountEmail: email.account
-      });
-
-      if (aiResult && !aiResult.needs_reply) {
-        newStatus = 'no_reply_needed';
-        newReason = aiResult.reason;
-        newConfidence = aiResult.confidence;
-      }
-
-      await new Promise(r => setTimeout(r, 5000));
-    }
-
-    if (newStatus !== email.status) {
-      await supabase
-        .from('emails')
-        .update({
-          status: newStatus,
-          is_system_generated: newStatus === 'no_reply_needed',
-          ai_reason: newReason,
-          ai_confidence: newConfidence,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', email.id);
-
-      changed++;
-      console.log(`  [${email.status} → ${newStatus}] ${email.subject.slice(0, 50)}`);
-    }
-  }
-
-  console.log(`[AI Rescan] Done. ${changed}/${emails.length} reclassified`);
-  return { scanned: emails.length, changed };
-}
-
-// ── CHECK REPLIES ────────────────────────────────────────────────
-async function checkGmailReplies(accountEmail, gmail) {
+// ── REPLY CHECK: only buyer emails still status='unreplied' ─────
+async function checkPendingReplies(accountEmail, gmail) {
   try {
-    const sinceMs = Date.now() - 60 * 24 * 60 * 60 * 1000;
+    const { data: pending, error } = await supabase
+      .from('emails')
+      .select('id, thread_id, received_at, subject')
+      .eq('account', accountEmail)
+      .eq('status', 'unreplied');
 
-    const sentRes = await gmail.users.messages.list({
-      userId: 'me',
-      maxResults: 500,
-      labelIds: ['SENT'],
-    });
+    if (error) {
+      console.error(`[Gmail] Pending query error for ${accountEmail}:`, error.message);
+      return;
+    }
 
-    const sentMessages = sentRes.data.messages || [];
-    if (!sentMessages.length) return;
+    if (!pending?.length) {
+      console.log(`[Gmail] ${accountEmail}: no pending buyer emails to check`);
+      return;
+    }
 
-    const threadIds = [];
-    const sentToEmails = [];
+    console.log(`[Gmail] ${accountEmail}: checking ${pending.length} pending buyer threads`);
 
-    for (const msg of sentMessages.slice(0, 500)) {
-      const detail = await gmail.users.messages.get({
-        userId: 'me',
-        id: msg.id,
-        format: 'metadata',
-        metadataHeaders: ['To', 'Subject', 'Date']
-      });
+    const toMarkReplied = [];
 
-      const internalDate = parseInt(detail.data.internalDate || '0');
-      if (internalDate > sinceMs && detail.data.threadId) {
-        threadIds.push(detail.data.threadId);
+    for (const email of pending) {
+      if (!email.thread_id) continue;
 
-        const headers = detail.data.payload?.headers || [];
-        const toHeader = headers.find(h => h.name === 'To')?.value || '';
-        const subjectHeader = headers.find(h => h.name === 'Subject')?.value || '';
-        const cleanSubject = subjectHeader.replace(/^(re|fw|fwd|sv|reg|vs|vb|ang|tr):\s*/gi, '').trim().toLowerCase();
+      try {
+        const thread = await gmail.users.threads.get({
+          userId: 'me',
+          id: email.thread_id,
+          format: 'metadata',
+          metadataHeaders: ['From', 'Date']
+        });
 
-        const emailMatches = toHeader.match(/[\w.-]+@[\w.-]+\.\w+/g) || [];
-        for (const em of emailMatches) {
-          sentToEmails.push({ email: em.toLowerCase(), sentAt: internalDate, subject: cleanSubject });
-        }
+        const messages = thread.data.messages || [];
+        const receivedAtMs = new Date(email.received_at).getTime();
+
+        const hasReply = messages.some(m => {
+          const isSent = (m.labelIds || []).includes('SENT');
+          const msgDateMs = parseInt(m.internalDate || '0');
+          return isSent && msgDateMs > receivedAtMs;
+        });
+
+        if (hasReply) toMarkReplied.push(email.id);
+
+      } catch (threadErr) {
+        console.error(`[Gmail] Thread check failed for ${email.subject?.slice(0, 30)}:`, threadErr.message);
       }
     }
 
-    if (threadIds.length) {
-      const { data: unreplied } = await supabase
-        .from('emails')
-        .select('id')
-        .eq('account', accountEmail)
-        .eq('status', 'unreplied')
-        .in('thread_id', threadIds);
-
-      if (unreplied?.length) {
-        const ids = unreplied.map(e => e.id);
-        await supabase.from('emails').update({
-          status: 'replied',
-          replied_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        }).in('id', ids);
-        console.log(`[Gmail] ${accountEmail}: ${ids.length} marked replied (thread match)`);
-      }
-    }
-
-    if (sentToEmails.length) {
-      const { data: unrepliedEmails } = await supabase
-        .from('emails')
-        .select('id, sender_email, received_at, subject')
-        .eq('account', accountEmail)
-        .eq('status', 'unreplied')
-        .gte('received_at', new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString());
-
-      if (unrepliedEmails?.length) {
-        const toMarkReplied = [];
-        for (const email of unrepliedEmails) {
-          const senderLower = (email.sender_email || '').toLowerCase();
-          const receivedAt = new Date(email.received_at).getTime();
-          const emailSubject = (email.subject || '').replace(/^(re|fw|fwd|sv|reg|vs|vb|ang|tr):\s*/gi, '').trim().toLowerCase();
-
-          const replied = sentToEmails.some(sent =>
-            sent.email === senderLower &&
-            sent.sentAt > receivedAt &&
-            sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
-            (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
-          );
-
-          if (replied) toMarkReplied.push(email.id);
-        }
-
-        if (toMarkReplied.length) {
-          await supabase.from('emails').update({
-            status: 'replied',
-            replied_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }).in('id', toMarkReplied);
-          console.log(`[Gmail] ${accountEmail}: ${toMarkReplied.length} marked replied (sender match)`);
-        }
-      }
-    }
-
-    if (sentToEmails.length) {
-      const { data: internalEmails } = await supabase
-        .from('emails')
-        .select('id, sender_email, received_at, subject')
-        .eq('account', accountEmail)
-        .eq('status', 'internal')
-        .gte('received_at', new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString());
-
-      if (internalEmails?.length) {
-        const toMarkInternalReplied = [];
-        for (const email of internalEmails) {
-          const senderLower = (email.sender_email || '').toLowerCase();
-          const receivedAt = new Date(email.received_at).getTime();
-          const emailSubject = (email.subject || '').replace(/^(re|fw|fwd|sv|reg|vs|vb|ang|tr):\s*/gi, '').trim().toLowerCase();
-
-          const replied = sentToEmails.some(sent =>
-            sent.email === senderLower &&
-            sent.sentAt > receivedAt &&
-            sent.sentAt < receivedAt + 7 * 24 * 60 * 60 * 1000 &&
-            (sent.subject === emailSubject || sent.subject.includes(emailSubject) || emailSubject.includes(sent.subject))
-          );
-
-          if (replied) toMarkInternalReplied.push(email.id);
-        }
-
-        if (toMarkInternalReplied.length) {
-          await supabase.from('emails').update({
-            status: 'internal_replied',
-            replied_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }).in('id', toMarkInternalReplied);
-          console.log(`[Gmail] ${accountEmail}: ${toMarkInternalReplied.length} internal emails marked replied`);
-        }
-      }
+    if (toMarkReplied.length) {
+      await supabase.from('emails').update({
+        status: 'replied',
+        replied_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }).in('id', toMarkReplied);
+      console.log(`[Gmail] ${accountEmail}: ${toMarkReplied.length} marked replied`);
+    } else {
+      console.log(`[Gmail] ${accountEmail}: none of the pending threads have replies yet`);
     }
 
   } catch (err) {
@@ -517,6 +430,8 @@ async function checkGmailReplies(accountEmail, gmail) {
 
 // ── MAIN ─────────────────────────────────────────────────────────
 async function runGmailFetcher() {
+  const domainConfig = await loadDomainConfig();
+
   const { data: users, error } = await supabase
     .from('users')
     .select('account_email, gmail_token')
@@ -528,9 +443,7 @@ async function runGmailFetcher() {
   }
 
   const envAccounts = (process.env.GMAIL_ACCOUNTS || '')
-    .split(',')
-    .map(e => e.trim())
-    .filter(Boolean);
+    .split(',').map(e => e.trim()).filter(Boolean);
 
   const allAccounts = [...new Set([
     ...(users || []).map(u => u.account_email),
@@ -543,11 +456,23 @@ async function runGmailFetcher() {
   }
 
   console.log(`[Gmail] Fetching ${allAccounts.length} accounts`);
-  // Sequential (not parallel) — keeps AI calls from stacking across accounts
-  // and hitting the rate limit even harder
+
   for (const account of allAccounts) {
-    await fetchGmailEmails(account);
+    const tokens = await getTokenFromSupabase(account);
+    if (!tokens) continue;
+
+    await fetchGmailEmails(account, domainConfig);
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID,
+      process.env.GMAIL_CLIENT_SECRET,
+      process.env.GMAIL_REDIRECT_URI
+    );
+    oauth2Client.setCredentials(tokens);
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    await checkPendingReplies(account, gmail);
   }
+
   console.log('[Gmail] Done.');
 }
 
@@ -558,9 +483,7 @@ async function runReplyCheckOnly() {
     .not('gmail_token', 'is', null);
 
   const envAccounts = (process.env.GMAIL_ACCOUNTS || '')
-    .split(',')
-    .map(e => e.trim())
-    .filter(Boolean);
+    .split(',').map(e => e.trim()).filter(Boolean);
 
   const allAccounts = [...new Set([
     ...(users || []).map(u => u.account_email),
@@ -569,7 +492,6 @@ async function runReplyCheckOnly() {
 
   if (!allAccounts.length) return;
 
-  console.log(`[Gmail] Reply-check-only for ${allAccounts.length} accounts`);
   for (const account of allAccounts) {
     const tokens = await getTokenFromSupabase(account);
     if (!tokens) continue;
@@ -579,12 +501,10 @@ async function runReplyCheckOnly() {
       process.env.GMAIL_CLIENT_SECRET,
       process.env.GMAIL_REDIRECT_URI
     );
-
     oauth2Client.setCredentials(tokens);
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    await checkGmailReplies(account, gmail);
+    await checkPendingReplies(account, gmail);
   }
-  console.log('[Gmail] Reply-check-only done.');
 }
 
-module.exports = { runGmailFetcher, saveTokenToSupabase, aiRescanExistingEmails, runReplyCheckOnly };
+module.exports = { runGmailFetcher, saveTokenToSupabase, runReplyCheckOnly, loadDomainConfig };
