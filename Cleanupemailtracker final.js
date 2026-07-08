@@ -1,227 +1,127 @@
-// cleanupEmailTracker-FINAL.js
-// Run ONCE: node cleanupEmailTracker-FINAL.js
-// Then delete this file
+// cleanupUntrackedEmails.js
+// ONE-TIME script. Run once, then delete.
+//
+// Problem this fixes: gmailFetcher.js's buyer-allowlist/keyword gate only
+// blocks NEW incoming mail from being inserted. It has no effect on rows
+// already sitting in the emails table from before this gate existed.
+// This script applies the exact same current gate logic against every
+// existing row currently in status='unreplied' and removes anything that
+// doesn't actually match internal_identifiers, tracked_buyer_domains, or
+// tracked_keywords.
+//
+// This is destructive — non-matching rows are DELETED, not archived.
+// If you want a safety net instead, change the DELETE block below to an
+// UPDATE that sets status = 'ignored_untracked' instead.
 
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
-const { classifyEmail } = require('./backend/aiClassifier');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ── SAME DETECTION LOGIC AS gmailFetcher-FINAL.js ──────────────
-
-const DO_NOT_REPLY_KEYWORDS = [
-  'notification-only address',
-  'do not reply',
-  'do-not-reply',
-  'cannot accept incoming',
-  'no-reply',
-  'noreply',
-  'automated message',
-  'automated response',
-  'this is an automated',
-  'please do not respond',
-  'please do not reply',
-  'do not respond to this',
-  'mailer-daemon',
-  'postmaster',
-  'undeliverable',
-  'out of office',
-];
-
-const FYI_KEYWORDS = [
-  'for your information',
-  'for information only',
-  'for your reference',
-  'fyi',
-  'for awareness',
-  'please note',
-  'for your attention',
-  'inward team has already sent',
-  'already processed',
-  'already handled',
-  'in case you need',
-  'status update',
-  'information only',
-  'tracking update',
-  'shipment status',
-  'order confirmation',
-  'invoice attached',
-  'attached invoice',
-];
-
-const INTERNAL_DOMAINS = ['kishorexports.com', 'kishorexports.ai'];
-const OBVIOUS_SYSTEM_DOMAINS = [
-  'railway.app', 'github.com', 'render.com', 'vercel.app',
-  'google.com', 'googlemail.com', 'linkedin.com', 'twitter.com',
-  'mailchimp.com', 'sendgrid.net', 'amazonses.com',
-  'hdfcbank.com', 'sbi.co.in', 'icicibank.com', 'axisbank.com',
-  'kotak.com', 'yesbank.in', 'canarabank.com', 'paytm.com',
-  'razorpay.com', 'stripe.com', 'paypal.com', 'zoom.us',
-  'slack.com', 'ul.com', 'ftncv.com', 'dhl.com', 'fedex.com'
-];
-
-function isInternalEmail(senderEmail, senderName) {
+function isInternalEmail(senderEmail, senderName, internalPatterns) {
   const emailLower = (senderEmail || '').toLowerCase();
   const nameLower = (senderName || '').toLowerCase();
-  const domain = emailLower.split('@')[1] || '';
-  
-  if (INTERNAL_DOMAINS.some(d => domain.includes(d))) return true;
-  if (emailLower.includes('kishor')) return true;
-  if (nameLower.includes('kishor')) return true;
-  
-  return false;
+  return internalPatterns.some(p => emailLower.includes(p) || nameLower.includes(p));
 }
 
-function isSystemEmail(senderEmail) {
-  const lower = (senderEmail || '').toLowerCase();
-  const domain = lower.split('@')[1] || '';
-  
-  return OBVIOUS_SYSTEM_DOMAINS.some(d => domain.includes(d)) ||
-         lower.includes('noreply') || lower.includes('billing') || 
-         lower.includes('invoice') || lower.includes('automated');
+function isBuyerDomain(senderEmail, buyerDomains) {
+  const domain = (senderEmail || '').toLowerCase().split('@')[1] || '';
+  return buyerDomains.has(domain);
 }
 
-function detectByBodyContent(bodySnippet) {
-  const lower = (bodySnippet || '').toLowerCase();
-  
-  if (DO_NOT_REPLY_KEYWORDS.some(k => lower.includes(k))) {
-    return { status: 'no_reply_needed', reason: 'Notification-only email (body text)' };
+function matchesTrackedKeyword(subject, bodySnippet, senderEmail, senderName, trackedKeywords) {
+  const haystack = `${subject || ''} ${bodySnippet || ''} ${senderEmail || ''} ${senderName || ''}`.toLowerCase();
+  return trackedKeywords.some(kw => {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\b${escaped}\\b`, 'i');
+    return re.test(haystack);
+  });
+}
+
+async function loadCurrentConfig() {
+  const [buyerRes, internalRes, keywordRes] = await Promise.all([
+    supabase.from('tracked_buyer_domains').select('domain').eq('active', true),
+    supabase.from('internal_identifiers').select('pattern').eq('active', true),
+    supabase.from('tracked_keywords').select('keyword').eq('active', true),
+  ]);
+
+  const buyerDomains = new Set((buyerRes.data || []).map(r => r.domain.toLowerCase()));
+  const internalPatterns = (internalRes.data || []).map(r => r.pattern.toLowerCase());
+  const trackedKeywords = (keywordRes.data || []).map(r => r.keyword.toLowerCase());
+
+  console.log(`[Config] Loaded ${buyerDomains.size} buyer domains, ${internalPatterns.length} internal patterns, ${trackedKeywords.length} keywords`);
+
+  if (buyerDomains.size === 0 || internalPatterns.length === 0) {
+    console.error('[Config] ABORTING — buyer domains or internal patterns are empty. Fix Supabase config before running this, or you will delete everything.');
+    process.exit(1);
   }
-  
-  if (FYI_KEYWORDS.some(k => lower.includes(k))) {
-    return { status: 'no_reply_needed', reason: 'Informational email (for reference only)' };
-  }
-  
-  return null;
+
+  return { buyerDomains, internalPatterns, trackedKeywords };
 }
 
-// ──────────────────────────────────────────────────────────────────
+async function cleanup() {
+  const { buyerDomains, internalPatterns, trackedKeywords } = await loadCurrentConfig();
 
-async function cleanupEmails() {
-  console.log('[Cleanup] Starting email re-classification...\n');
-
-  const { data: allEmails, error } = await supabase
+  const { data: rows, error } = await supabase
     .from('emails')
-    .select('*')
-    .order('received_at', { ascending: false });
+    .select('id, sender_email, sender_name, subject, body_preview, status');
 
-  if (error || !allEmails?.length) {
-    console.log('[Cleanup] No emails found or error:', error?.message);
+  if (error) {
+    console.error('[Cleanup] Query error:', error.message);
     return;
   }
 
-  console.log(`[Cleanup] Found ${allEmails.length} total emails\n`);
+  if (!rows?.length) {
+    console.log('[Cleanup] No rows found.');
+    return;
+  }
 
-  const seen = new Set();
+  console.log(`[Cleanup] Scanning ${rows.length} total rows against current gate logic...\n`);
+
   const toDelete = [];
-  const toUpdate = [];
-  let internalCount = 0;
-  let noReplyCount = 0;
-  let unrepliedCount = 0;
+  const toReclassifyInternal = [];
+  let keptAsIs = 0;
 
-  // ── Step 1: Classify and find duplicates ──
-  for (const email of allEmails) {
-    // Check for duplicates
-    if (seen.has(email.email_id)) {
-      toDelete.push(email.id);
-      console.log(`  [DUP] ${email.subject.slice(0, 40)}`);
-      continue;
-    }
-    seen.add(email.email_id);
+  for (const row of rows) {
+    const isInternal = isInternalEmail(row.sender_email, row.sender_name, internalPatterns);
+    const isBuyer = !isInternal && (
+      isBuyerDomain(row.sender_email, buyerDomains) ||
+      matchesTrackedKeyword(row.subject, row.body_preview, row.sender_email, row.sender_name, trackedKeywords)
+    );
 
-    let newStatus = email.status;
-    let newReason = email.ai_reason;
-    let newConfidence = email.ai_confidence;
-
-    // 1. Internal check
-    if (isInternalEmail(email.sender_email, email.sender_name)) {
-      newStatus = 'internal';
-      newReason = 'Internal Kishor email (auto-detect)';
-      newConfidence = 'high';
-      internalCount++;
-    }
-    // 2. Body content check (notification-only, FYI)
-    else {
-      const bodyDetection = detectByBodyContent(email.body_preview);
-      if (bodyDetection) {
-        newStatus = 'no_reply_needed';
-        newReason = bodyDetection.reason;
-        newConfidence = 'high';
-        noReplyCount++;
-      }
-      // 3. System check
-      else if (isSystemEmail(email.sender_email)) {
-        newStatus = 'no_reply_needed';
-        newReason = 'Auto-detected: system/bank email';
-        newConfidence = 'high';
-        noReplyCount++;
-      } else {
-        unrepliedCount++;
-      }
-    }
-
-    // Track changes only if status changed
-    if (newStatus !== email.status || newReason !== email.ai_reason) {
-      toUpdate.push({
-        id: email.id,
-        oldStatus: email.status,
-        newStatus,
-        newReason,
-        newConfidence,
-        subject: email.subject.slice(0, 50),
-        sender: email.sender_email
-      });
+    if (isInternal && row.status !== 'internal') {
+      toReclassifyInternal.push(row.id);
+      console.log(`  [→ internal] ${row.subject?.slice(0, 50)} (${row.sender_email})`);
+    } else if (!isInternal && !isBuyer) {
+      toDelete.push(row.id);
+      console.log(`  [DELETE - untracked] ${row.subject?.slice(0, 50)} (${row.sender_email})`);
+    } else {
+      keptAsIs++;
     }
   }
 
-  // ── Step 2: Delete duplicates ──
+  console.log(`\n[Cleanup] Summary: ${toDelete.length} to delete, ${toReclassifyInternal.length} to reclassify as internal, ${keptAsIs} already correct\n`);
+
+  if (toReclassifyInternal.length) {
+    const { error: reErr } = await supabase
+      .from('emails')
+      .update({ status: 'internal', ai_reason: 'Internal identifier match (retroactive cleanup)', updated_at: new Date().toISOString() })
+      .in('id', toReclassifyInternal);
+    if (reErr) console.error('[Cleanup] Reclassify error:', reErr.message);
+    else console.log(`[Cleanup] ✅ Reclassified ${toReclassifyInternal.length} rows as internal`);
+  }
+
   if (toDelete.length) {
-    console.log(`\n[Cleanup] Deleting ${toDelete.length} duplicate emails...`);
-    const { error: delError } = await supabase
+    const { error: delErr } = await supabase
       .from('emails')
       .delete()
       .in('id', toDelete);
-    
-    if (delError) {
-      console.error('[Cleanup] Delete error:', delError.message);
-    } else {
-      console.log(`[Cleanup] ✅ Deleted ${toDelete.length} duplicates\n`);
-    }
+    if (delErr) console.error('[Cleanup] Delete error:', delErr.message);
+    else console.log(`[Cleanup] ✅ Deleted ${toDelete.length} untracked rows`);
   }
 
-  // ── Step 3: Update re-classified emails ──
-  if (toUpdate.length) {
-    console.log(`[Cleanup] Re-classifying ${toUpdate.length} emails...\n`);
-    
-    for (const item of toUpdate) {
-      const { error: upError } = await supabase
-        .from('emails')
-        .update({
-          status: item.newStatus,
-          ai_reason: item.newReason,
-          ai_confidence: item.newConfidence,
-          is_system_generated: item.newStatus === 'no_reply_needed',
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', item.id);
-
-      if (upError) {
-        console.log(`  [ERR] ${item.subject}: ${upError.message}`);
-      } else {
-        console.log(`  [${item.oldStatus} → ${item.newStatus}] ${item.subject} (${item.sender})`);
-      }
-    }
-  }
-
-  // ── Final stats ──
-  console.log(`\n[Cleanup] ✅ DONE!\n`);
-  console.log(`Email Breakdown:`);
-  console.log(`  Internal: ${internalCount}`);
-  console.log(`  No Reply Needed: ${noReplyCount}`);
-  console.log(`  Unreplied (needs action): ${unrepliedCount}`);
-  console.log(`  Duplicates deleted: ${toDelete.length}`);
-  console.log(`  Reclassified: ${toUpdate.length}`);
+  console.log('\n[Cleanup] Done.');
 }
 
-cleanupEmails().catch(console.error);
+cleanup().catch(console.error);
+
