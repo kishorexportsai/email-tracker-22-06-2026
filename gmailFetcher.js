@@ -97,9 +97,10 @@ function getHeader(headers, name) {
 
 // ── LOAD THE TWO CONFIGURABLE LISTS (once per run, not per message/account) ──
 async function loadDomainConfig() {
-  const [buyerRes, internalRes] = await Promise.all([
+  const [buyerRes, internalRes, keywordRes] = await Promise.all([
     supabase.from('tracked_buyer_domains').select('domain').eq('active', true),
     supabase.from('internal_identifiers').select('pattern').eq('active', true),
+    supabase.from('tracked_keywords').select('keyword').eq('active', true),
   ]);
 
   if (buyerRes.error) {
@@ -108,9 +109,13 @@ async function loadDomainConfig() {
   if (internalRes.error) {
     console.error('[Config] Failed to load internal_identifiers:', internalRes.error.message);
   }
+  if (keywordRes.error) {
+    console.error('[Config] Failed to load tracked_keywords:', keywordRes.error.message);
+  }
 
   const buyerDomains = new Set((buyerRes.data || []).map(r => r.domain.toLowerCase()));
   const internalPatterns = (internalRes.data || []).map(r => r.pattern.toLowerCase());
+  const trackedKeywords = (keywordRes.data || []).map(r => r.keyword.toLowerCase());
 
   if (buyerDomains.size === 0) {
     console.warn('[Config] WARNING: tracked_buyer_domains is empty — no buyer emails will be tracked this cycle.');
@@ -119,7 +124,19 @@ async function loadDomainConfig() {
     console.warn('[Config] WARNING: internal_identifiers is empty — Internal Mails tab will get nothing this cycle.');
   }
 
-  return { buyerDomains, internalPatterns };
+  return { buyerDomains, internalPatterns, trackedKeywords };
+}
+
+// Word-boundary match against subject, body, and sender email/name —
+// NOT plain substring, so 'pop' won't match inside 'population'.
+// Multi-word keywords like 'green cotton' still work since \b anchors on both ends.
+function matchesTrackedKeyword(subject, bodySnippet, senderEmail, senderName, trackedKeywords) {
+  const haystack = `${subject || ''} ${bodySnippet || ''} ${senderEmail || ''} ${senderName || ''}`.toLowerCase();
+  return trackedKeywords.some(kw => {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`\\b${escaped}\\b`, 'i');
+    return re.test(haystack);
+  });
 }
 
 function isInternalEmail(senderEmail, senderName, internalPatterns) {
@@ -182,7 +199,7 @@ async function saveTokenToSupabase(accountEmail, tokens) {
 
 // ── FETCH: buyer domains + internal patterns, everything else ignored ──
 async function fetchGmailEmails(accountEmail, domainConfig) {
-  const { buyerDomains, internalPatterns } = domainConfig;
+  const { buyerDomains, internalPatterns, trackedKeywords } = domainConfig;
 
   const tokens = await getTokenFromSupabase(accountEmail);
   if (!tokens) return 0;
@@ -263,9 +280,16 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
       const senderName = from.replace(/<.+>/, '').trim().replace(/"/g, '');
       const receivedAt = date ? new Date(date).toISOString() : new Date().toISOString();
 
-      // ── GATE: must match internal pattern OR buyer domain, else fully ignored ──
+      // ── GATE: must match internal pattern OR buyer domain OR tracked keyword ──
+      // Keyword match is a real widening of scope beyond the strict domain allowlist —
+      // any sender mentioning a tracked company name in subject/body/their own address
+      // now gets tracked, not just known buyer domains. Confirmed explicitly by user.
       const isInternal = isInternalEmail(senderEmail, senderName, internalPatterns);
-      const isBuyer = !isInternal && isBuyerDomain(senderEmail, buyerDomains);
+      const isDomainBuyer = isBuyerDomain(senderEmail, buyerDomains);
+      const isKeywordBuyer = matchesTrackedKeyword(
+        subject, detail.data.snippet, senderEmail, senderName, trackedKeywords
+      );
+      const isBuyer = !isInternal && (isDomainBuyer || isKeywordBuyer);
 
       if (!isInternal && !isBuyer) {
         ignoredNonTracked++;
