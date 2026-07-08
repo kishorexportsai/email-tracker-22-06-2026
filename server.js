@@ -8,7 +8,12 @@ const jwt = require('jsonwebtoken');
 const path = require('path');
 const { google } = require('googleapis');
 const { createClient } = require('@supabase/supabase-js');
-const { runGmailFetcher, saveTokenToSupabase, aiRescanExistingEmails, runReplyCheckOnly } = require('./gmailFetcher');
+const { runGmailFetcher, saveTokenToSupabase, runReplyCheckOnly } = require('./gmailFetcher');
+// NOTE: aiRescanExistingEmails no longer exists in gmailFetcher.js as of the
+// buyer-allowlist rewrite. It was a bulk-rescan-everything function, which
+// directly contradicts the egress-reduction work done since (skip-if-exists,
+// 48h window, per-thread reply checks). Do not re-add it without redesigning
+// it to respect the same constraints.
 const { sendDailyAgentReminders, sendDailyManagerReminders, sendWeeklyReports } = require('./reminderSender');
 
 const app = express();
@@ -400,11 +405,14 @@ app.post('/api/trigger/fetch', authMiddleware, async (req, res) => {
 });
 
 // ─── AI RESCAN ───────────────────────────────────────────────────
-app.post('/api/trigger/ai-rescan', authMiddleware, async (req, res) => {
-  if (req.user.role !== 'senior_manager') return res.status(403).json({ error: 'Forbidden' });
-  res.json({ message: 'AI rescan started. Check Railway logs for progress.' });
-  aiRescanExistingEmails().catch(console.error);
-});
+// REMOVED: this called aiRescanExistingEmails(), which no longer exists in
+// gmailFetcher.js since the buyer-allowlist rewrite. The call was undefined,
+// threw synchronously inside an unawaited async handler, and became an
+// unhandled promise rejection — which crashes the entire Node process on
+// Node >=15's default unhandledRejection behavior, not just this one request.
+// If a manual re-classification tool is needed later, it should be built to
+// scope only to status='unreplied' rows for tracked buyer domains (small,
+// bounded set) — not a full-table rescan, which is what this used to do.
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
@@ -417,3 +425,4 @@ app.listen(process.env.PORT || 3000, () => {
   console.log(`✅ Server running on port ${process.env.PORT || 3000}`);
   setTimeout(() => runGmailFetcher().catch(console.error), 5000);
 });
+
