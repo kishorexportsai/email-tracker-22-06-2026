@@ -1,23 +1,11 @@
-// backend/gmailFetcher.js - BUYER-ALLOWLIST + INTERNAL-PATTERN VERSION
+// backend/gmailFetcher.js - SPECIFIC EMAIL TRACKING VERSION
+// 
+// Changes:
+// - Tracks only 15 specific sender email addresses (not domains)
+// - Checks only last 5 days of emails
+// - Skips internal email tracking
+// - Ignores all other emails
 //
-// Two independent, DB-configurable lists (see migration_domain_tables.sql):
-//   tracked_buyer_domains  -> strict domain equality. Drives buyer unreplied/reminders/KPIs.
-//   internal_identifiers   -> substring match against email+name. Drives Internal Mails tab.
-//                             Kept as substring (not domain-only) because real internal senders
-//                             include gmail.com accounts like kishor.merchant24@gmail.com —
-//                             a domain-only table would miss those entirely.
-//
-// Any email whose sender matches NEITHER list is not inserted into the emails table at all.
-// This is intentional: buyer tracking is scoped to known accounts, onboarding a new buyer
-// means adding a row to tracked_buyer_domains, not a code change.
-//
-// Still retained from prior fixes:
-//   - 48h rolling fetch window (survives extended outages, not just cold-start spin-down)
-//   - skip-if-exists dedup before any classification/AI/insert work
-//   - reply-check scoped to status='unreplied' rows only, one thread.get() per pending row
-//     (no bulk 500-message SENT scan)
-//   - AI classification only reached for buyer-domain emails that aren't already resolved
-//     by BCC/CC/body-detection/system-domain checks — retry+backoff on 429
 
 require('dotenv').config();
 const { google } = require('googleapis');
@@ -26,8 +14,26 @@ const { classifyEmail } = require('./aiClassifier');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ── SYSTEM/NOISE DETECTION (still applies within buyer-domain mail —
-//    a buyer's own automated notification should still route to no_reply_needed) ──
+// ── 15 TRACKED SENDER EMAILS ──────────────────────────────────────────
+const TRACKED_SENDER_EMAILS = new Set([
+  'nirvana.balsingh@wefashion.com',
+  'ilona.van.de.schootbrugge@wefashion.com',
+  'kurt@kurtklingberg.se',
+  'cg@carebyme.dk',
+  'ivy.ho@polarnopyret.se',
+  'jo@lakor.dk',
+  'stine@lakor.dk',
+  'johnny.lai@polarnopyret.se',
+  'rishabh.shrivastava@ul.com',
+  'jeppe@lakor.dk',
+  'fiona@littleones.ie',
+  'mg@carebyme.dk',
+  'bettina@gai-lisva.com',
+  'camillad@luxkids.dk',
+  'emma@emmamalena.com'
+].map(e => e.toLowerCase()));
+
+// ── SYSTEM/NOISE DETECTION ────────────────────────────────────────────
 const OBVIOUS_SYSTEM_DOMAINS = [
   'railway.app', 'github.com', 'github.io', 'render.com', 'vercel.app',
   'google.com', 'accounts.google.com', 'googlemail.com',
@@ -95,81 +101,7 @@ function getHeader(headers, name) {
   return headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 }
 
-// ── LOAD THE TWO CONFIGURABLE LISTS (once per run, not per message/account) ──
-async function loadDomainConfig() {
-  const [buyerRes, internalRes, keywordRes] = await Promise.all([
-    supabase.from('tracked_buyer_domains').select('domain').eq('active', true),
-    supabase.from('internal_identifiers').select('pattern').eq('active', true),
-    supabase.from('tracked_keywords').select('keyword').eq('active', true),
-  ]);
-
-  if (buyerRes.error) {
-    console.error('[Config] Failed to load tracked_buyer_domains:', buyerRes.error.message);
-  }
-  if (internalRes.error) {
-    console.error('[Config] Failed to load internal_identifiers:', internalRes.error.message);
-  }
-  if (keywordRes.error) {
-    console.error('[Config] Failed to load tracked_keywords:', keywordRes.error.message);
-  }
-
-  const buyerDomains = new Set((buyerRes.data || []).map(r => r.domain.toLowerCase()));
-  const internalPatterns = (internalRes.data || []).map(r => r.pattern.toLowerCase());
-  const trackedKeywords = (keywordRes.data || []).map(r => r.keyword.toLowerCase());
-
-  if (buyerDomains.size === 0) {
-    console.warn('[Config] WARNING: tracked_buyer_domains is empty — no buyer emails will be tracked this cycle.');
-  }
-  if (internalPatterns.length === 0) {
-    console.warn('[Config] WARNING: internal_identifiers is empty — Internal Mails tab will get nothing this cycle.');
-  }
-
-  return { buyerDomains, internalPatterns, trackedKeywords };
-}
-
-// Word-boundary match against subject, body, and sender email/name —
-// NOT plain substring, so 'pop' won't match inside 'population'.
-// Multi-word keywords like 'green cotton' still work since \b anchors on both ends.
-function matchesTrackedKeyword(subject, bodySnippet, senderEmail, senderName, trackedKeywords) {
-  const haystack = `${subject || ''} ${bodySnippet || ''} ${senderEmail || ''} ${senderName || ''}`.toLowerCase();
-  return trackedKeywords.some(kw => {
-    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(`\\b${escaped}\\b`, 'i');
-    return re.test(haystack);
-  });
-}
-
-function isInternalEmail(senderEmail, senderName, internalPatterns) {
-  const emailLower = (senderEmail || '').toLowerCase();
-  const nameLower = (senderName || '').toLowerCase();
-  return internalPatterns.some(p => emailLower.includes(p) || nameLower.includes(p));
-}
-
-function isBuyerDomain(senderEmail, buyerDomains) {
-  const domain = (senderEmail || '').toLowerCase().split('@')[1] || '';
-  return buyerDomains.has(domain);
-}
-
-async function classifyEmailSafe(params, maxRetries = 3) {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await classifyEmail(params);
-    } catch (err) {
-      const is429 = err?.status === 429 || err?.message?.includes('429');
-      const isLast = attempt === maxRetries;
-      if (!is429 || isLast) {
-        console.error(`[AI] Failed (attempt ${attempt + 1}):`, err.message);
-        return null;
-      }
-      const backoffMs = 5000 * Math.pow(2, attempt);
-      console.log(`[AI] Rate limited. Retrying in ${backoffMs / 1000}s...`);
-      await new Promise(r => setTimeout(r, backoffMs));
-    }
-  }
-  return null;
-}
-
-// ── TOKEN STORAGE ─────────────────────────────────────────────────
+// ── TOKEN STORAGE ─────────────────────────────────────────────────────
 async function getTokenFromSupabase(accountEmail) {
   const { data, error } = await supabase
     .from('users')
@@ -197,10 +129,8 @@ async function saveTokenToSupabase(accountEmail, tokens) {
   if (error) console.error(`[Gmail] Failed to save token for ${accountEmail}:`, error.message);
 }
 
-// ── FETCH: buyer domains + internal patterns, everything else ignored ──
-async function fetchGmailEmails(accountEmail, domainConfig) {
-  const { buyerDomains, internalPatterns, trackedKeywords } = domainConfig;
-
+// ── FETCH: only tracked sender emails from last 5 days ──────────────────
+async function fetchGmailEmails(accountEmail) {
   const tokens = await getTokenFromSupabase(accountEmail);
   if (!tokens) return 0;
 
@@ -213,130 +143,95 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
   oauth2Client.setCredentials(tokens);
   oauth2Client.on('tokens', async (newTokens) => {
     await saveTokenToSupabase(accountEmail, { ...tokens, ...newTokens });
-    console.log(`[Gmail] Token refreshed for ${accountEmail}`);
   });
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
   try {
-    // 48h window — survives extended outages (deploy failures, quota blocks),
-    // not just brief cold-start spin-downs. Still has a hard ceiling beyond 48h;
-    // historyId-based incremental sync would remove that ceiling entirely if ever needed.
-    const windowStart = new Date(Date.now() - 48 * 60 * 60 * 1000);
-    const after = Math.floor(windowStart.getTime() / 1000);
+    // Calculate 5 days ago
+    const fiveDaysAgo = new Date();
+    fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
+    const afterDate = fiveDaysAgo.toISOString().split('T')[0];
 
-    // NOT narrowing this query to from:(buyer domains) server-side — Gmail's from:
-    // operator behavior on substring internal patterns isn't reliably documented,
-    // and mixing exact-domain (buyer) with substring (internal) filters in one query
-    // risks silent gaps. Filtering happens client-side after listing instead.
-    const listRes = await gmail.users.messages.list({
+    // Build query: only inbox, after 5 days ago
+    const query = `in:inbox after:${afterDate}`;
+
+    console.log(`[Gmail] Fetching ${accountEmail} — emails from last 5 days`);
+
+    const messages = await gmail.users.messages.list({
       userId: 'me',
-      maxResults: 300,
-      labelIds: ['INBOX', 'CATEGORY_PERSONAL'],
-      q: `after:${after}`
+      q: query,
+      maxResults: 500
     });
 
-    const messages = listRes.data.messages || [];
-    console.log(`[Gmail] ${accountEmail}: ${messages.length} messages in 48h window`);
-
-    if (!messages.length) return 0;
-
-    // Skip-if-exists: batched check before any per-message work
-    const messageIds = messages.map(m => m.id);
-    const { data: existing } = await supabase
-      .from('emails')
-      .select('email_id')
-      .in('email_id', messageIds);
-
-    const existingIds = new Set((existing || []).map(e => e.email_id));
-    const newMessages = messages.filter(m => !existingIds.has(m.id));
-
-    console.log(`[Gmail] ${accountEmail}: ${newMessages.length} new, ${existingIds.size} already saved (skipped)`);
-
-    if (!newMessages.length) return 0;
+    if (!messages.data.messages || messages.data.messages.length === 0) {
+      console.log(`[Gmail] ${accountEmail}: no emails in last 5 days`);
+      return 0;
+    }
 
     let saved = 0;
-    let ignoredNonTracked = 0;
+    let ignoredNotTracked = 0;
 
-    for (const msg of newMessages) {
+    for (const msg of messages.data.messages) {
+      // Check if already exists
+      const { data: existing } = await supabase
+        .from('emails')
+        .select('id')
+        .eq('email_id', msg.id)
+        .single();
+
+      if (existing) {
+        continue; // Skip if already in DB
+      }
+
+      // Get full message details
       const detail = await gmail.users.messages.get({
         userId: 'me',
         id: msg.id,
-        format: 'metadata',
-        metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Date', 'Message-ID', 'List-Unsubscribe']
+        format: 'full'
       });
 
-      const headers = detail.data.payload?.headers || [];
-      const labelIds = detail.data.labelIds || [];
-      const from = getHeader(headers, 'From');
-      const toHeader = getHeader(headers, 'To');
-      const ccHeader = getHeader(headers, 'Cc');
-      const subject = getHeader(headers, 'Subject') || '(No Subject)';
-      const date = getHeader(headers, 'Date');
-      const listUnsub = getHeader(headers, 'List-Unsubscribe');
+      const headers = detail.data.payload.headers || [];
+      const senderEmail = getHeader(headers, 'From').match(/<(.+?)>/)?.[1] || getHeader(headers, 'From');
+      const senderName = getHeader(headers, 'From').split('<')[0].trim();
 
-      const emailMatch = from.match(/<(.+)>/);
-      const senderEmail = emailMatch ? emailMatch[1] : from;
-      const senderName = from.replace(/<.+>/, '').trim().replace(/"/g, '');
-      const receivedAt = date ? new Date(date).toISOString() : new Date().toISOString();
-
-      // ── GATE: must match internal pattern OR buyer domain OR tracked keyword ──
-      // Keyword match is a real widening of scope beyond the strict domain allowlist —
-      // any sender mentioning a tracked company name in subject/body/their own address
-      // now gets tracked, not just known buyer domains. Confirmed explicitly by user.
-      const isInternal = isInternalEmail(senderEmail, senderName, internalPatterns);
-      const isDomainBuyer = isBuyerDomain(senderEmail, buyerDomains);
-      const isKeywordBuyer = matchesTrackedKeyword(
-        subject, detail.data.snippet, senderEmail, senderName, trackedKeywords
-      );
-      const isBuyer = !isInternal && (isDomainBuyer || isKeywordBuyer);
-
-      if (!isInternal && !isBuyer) {
-        ignoredNonTracked++;
-        continue; // not inserted at all — not a buyer, not internal
+      // ── CHECK IF THIS IS ONE OF OUR 15 TRACKED EMAILS ──
+      if (!TRACKED_SENDER_EMAILS.has(senderEmail.toLowerCase())) {
+        ignoredNotTracked++;
+        continue;
       }
 
-      let status;
-      let aiReason = null;
-      let aiConfidence = null;
+      const subject = getHeader(headers, 'Subject') || '(No Subject)';
+      const toHeader = getHeader(headers, 'To');
+      const ccHeader = getHeader(headers, 'Cc');
+      const listUnsub = getHeader(headers, 'List-Unsubscribe') || '';
+      const receivedAtRaw = getHeader(headers, 'Date') || detail.data.internalDate;
 
-      if (isInternal) {
-        status = 'internal';
-        aiReason = 'Internal identifier match';
+      let receivedAt = new Date().toISOString();
+      if (receivedAtRaw) {
+        const parsed = new Date(receivedAtRaw);
+        if (!isNaN(parsed.getTime())) {
+          receivedAt = parsed.toISOString();
+        }
+      }
+
+      // ── CLASSIFICATION ────────────────────────────────────
+      const labelIds = detail.data.labelIds || [];
+      const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub);
+
+      let status = 'unreplied';
+      let aiReason = '';
+      let aiConfidence = 'medium';
+
+      if (obviouslySystem) {
+        status = 'no_reply_needed';
+        aiReason = 'Auto-detected: system/bulk email';
         aiConfidence = 'high';
       } else {
-        // Buyer-domain email — still run noise checks, a buyer's own
-        // automated system mail shouldn't count as a pending reply
-        const accountLower = accountEmail.toLowerCase();
-        const inTo = toHeader.toLowerCase().includes(accountLower);
-        const inCc = ccHeader.toLowerCase().includes(accountLower);
-        const isBcc = !inTo && !inCc;
-
-        const isOnlyCc = !inTo && inCc;
-        const bodySnippet = (detail.data.snippet || '').toLowerCase();
-        const amitMentioned = bodySnippet.includes('amit');
-        const ccNoAmit = isOnlyCc && !amitMentioned;
-
-        const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub.length > 0);
         const bodyDetection = detectByBodyContent(detail.data.snippet);
-
-        status = 'unreplied';
-
-        if (isBcc) {
-          status = 'no_reply_needed';
-          aiReason = 'BCC only — no reply needed';
-          aiConfidence = 'high';
-        } else if (ccNoAmit) {
-          status = 'no_reply_needed';
-          aiReason = 'CC only and Amit not mentioned — FYI email';
-          aiConfidence = 'high';
-        } else if (bodyDetection) {
+        if (bodyDetection) {
           status = bodyDetection.status;
           aiReason = bodyDetection.reason;
-          aiConfidence = 'high';
-        } else if (obviouslySystem) {
-          status = 'no_reply_needed';
-          aiReason = 'Auto-detected: system/bulk email';
           aiConfidence = 'high';
         } else {
           const aiResult = await classifyEmailSafe({
@@ -377,7 +272,7 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
       else console.error(`[Gmail] Insert error for ${msg.id}:`, error.message);
     }
 
-    console.log(`[Gmail] ${accountEmail}: ${saved} saved (buyer+internal), ${ignoredNonTracked} ignored (untracked domain)`);
+    console.log(`[Gmail] ${accountEmail}: ${saved} tracked emails saved, ${ignoredNotTracked} non-tracked emails ignored`);
     return saved;
 
   } catch (err) {
@@ -386,7 +281,26 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
   }
 }
 
-// ── REPLY CHECK: only buyer emails still status='unreplied' ─────
+async function classifyEmailSafe(params, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await classifyEmail(params);
+    } catch (err) {
+      const is429 = err?.status === 429 || err?.message?.includes('429');
+      const isLast = attempt === maxRetries;
+      if (!is429 || isLast) {
+        console.error(`[AI] Failed (attempt ${attempt + 1}):`, err.message);
+        return null;
+      }
+      const backoffMs = 5000 * Math.pow(2, attempt);
+      console.log(`[AI] Rate limited. Retrying in ${backoffMs / 1000}s...`);
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
+  }
+  return null;
+}
+
+// ── REPLY CHECK: only tracked buyer emails still status='unreplied' ─────
 async function checkPendingReplies(accountEmail, gmail) {
   try {
     const { data: pending, error } = await supabase
@@ -401,11 +315,11 @@ async function checkPendingReplies(accountEmail, gmail) {
     }
 
     if (!pending?.length) {
-      console.log(`[Gmail] ${accountEmail}: no pending buyer emails to check`);
+      console.log(`[Gmail] ${accountEmail}: no pending emails to check`);
       return;
     }
 
-    console.log(`[Gmail] ${accountEmail}: checking ${pending.length} pending buyer threads`);
+    console.log(`[Gmail] ${accountEmail}: checking ${pending.length} pending threads`);
 
     const toMarkReplied = [];
 
@@ -452,10 +366,8 @@ async function checkPendingReplies(accountEmail, gmail) {
   }
 }
 
-// ── MAIN ─────────────────────────────────────────────────────────
+// ── MAIN ─────────────────────────────────────────────────────────────────
 async function runGmailFetcher() {
-  const domainConfig = await loadDomainConfig();
-
   const { data: users, error } = await supabase
     .from('users')
     .select('account_email, gmail_token')
@@ -485,7 +397,7 @@ async function runGmailFetcher() {
     const tokens = await getTokenFromSupabase(account);
     if (!tokens) continue;
 
-    await fetchGmailEmails(account, domainConfig);
+    await fetchGmailEmails(account);
 
     const oauth2Client = new google.auth.OAuth2(
       process.env.GMAIL_CLIENT_ID,
@@ -531,4 +443,4 @@ async function runReplyCheckOnly() {
   }
 }
 
-module.exports = { runGmailFetcher, saveTokenToSupabase, runReplyCheckOnly, loadDomainConfig };
+module.exports = { runGmailFetcher, saveTokenToSupabase, runReplyCheckOnly };
