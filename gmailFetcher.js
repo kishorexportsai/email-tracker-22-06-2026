@@ -1,10 +1,5 @@
 // backend/gmailFetcher.js - SPECIFIC EMAIL TRACKING VERSION
-// 
-// Changes:
-// - Tracks only 15 specific sender email addresses (not domains)
-// - Checks only last 5 days of emails
-// - Skips internal email tracking
-// - Ignores all other emails
+// FIXED: Better email extraction + clearer logging
 //
 
 require('dotenv').config();
@@ -14,7 +9,7 @@ const { classifyEmail } = require('./aiClassifier');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ── 15 TRACKED SENDER EMAILS ──────────────────────────────────────────
+// ── 15 TRACKED SENDER EMAILS (EXACT MATCH, CASE-INSENSITIVE) ──────────
 const TRACKED_SENDER_EMAILS = new Set([
   'nirvana.balsingh@wefashion.com',
   'ilona.van.de.schootbrugge@wefashion.com',
@@ -33,7 +28,8 @@ const TRACKED_SENDER_EMAILS = new Set([
   'emma@emmamalena.com'
 ].map(e => e.toLowerCase()));
 
-// ── SYSTEM/NOISE DETECTION ────────────────────────────────────────────
+console.log('[Init] Loaded 15 tracked sender emails');
+
 const OBVIOUS_SYSTEM_DOMAINS = [
   'railway.app', 'github.com', 'github.io', 'render.com', 'vercel.app',
   'google.com', 'accounts.google.com', 'googlemail.com',
@@ -101,7 +97,6 @@ function getHeader(headers, name) {
   return headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 }
 
-// ── TOKEN STORAGE ─────────────────────────────────────────────────────
 async function getTokenFromSupabase(accountEmail) {
   const { data, error } = await supabase
     .from('users')
@@ -129,7 +124,6 @@ async function saveTokenToSupabase(accountEmail, tokens) {
   if (error) console.error(`[Gmail] Failed to save token for ${accountEmail}:`, error.message);
 }
 
-// ── FETCH: only tracked sender emails from last 5 days ──────────────────
 async function fetchGmailEmails(accountEmail) {
   const tokens = await getTokenFromSupabase(accountEmail);
   if (!tokens) return 0;
@@ -148,15 +142,13 @@ async function fetchGmailEmails(accountEmail) {
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
   try {
-    // Calculate 5 days ago
     const fiveDaysAgo = new Date();
     fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
     const afterDate = fiveDaysAgo.toISOString().split('T')[0];
 
-    // Build query: only inbox, after 5 days ago
     const query = `in:inbox after:${afterDate}`;
 
-    console.log(`[Gmail] Fetching ${accountEmail} — emails from last 5 days`);
+    console.log(`[Gmail] Fetching ${accountEmail} — emails from last 5 days (after ${afterDate})`);
 
     const messages = await gmail.users.messages.list({
       userId: 'me',
@@ -169,22 +161,20 @@ async function fetchGmailEmails(accountEmail) {
       return 0;
     }
 
+    console.log(`[Gmail] Found ${messages.data.messages.length} total emails in last 5 days`);
+
     let saved = 0;
     let ignoredNotTracked = 0;
 
     for (const msg of messages.data.messages) {
-      // Check if already exists
       const { data: existing } = await supabase
         .from('emails')
         .select('id')
         .eq('email_id', msg.id)
         .single();
 
-      if (existing) {
-        continue; // Skip if already in DB
-      }
+      if (existing) continue;
 
-      // Get full message details
       const detail = await gmail.users.messages.get({
         userId: 'me',
         id: msg.id,
@@ -192,14 +182,29 @@ async function fetchGmailEmails(accountEmail) {
       });
 
       const headers = detail.data.payload.headers || [];
-      const senderEmail = getHeader(headers, 'From').match(/<(.+?)>/)?.[1] || getHeader(headers, 'From');
-      const senderName = getHeader(headers, 'From').split('<')[0].trim();
+      const fromHeader = getHeader(headers, 'From') || '';
+      
+      // Extract email - try <email> format first, then fallback
+      let senderEmail = '';
+      const emailMatch = fromHeader.match(/<(.+?)>/);
+      if (emailMatch && emailMatch[1]) {
+        senderEmail = emailMatch[1].toLowerCase().trim();
+      } else {
+        senderEmail = fromHeader.toLowerCase().trim();
+      }
+      
+      const senderName = fromHeader.split('<')[0].trim();
 
-      // ── CHECK IF THIS IS ONE OF OUR 15 TRACKED EMAILS ──
-      if (!TRACKED_SENDER_EMAILS.has(senderEmail.toLowerCase())) {
+      // Check if tracked
+      const isTracked = TRACKED_SENDER_EMAILS.has(senderEmail);
+      
+      if (!isTracked) {
         ignoredNotTracked++;
+        console.log(`[Gmail] ❌ IGNORED (not tracked): ${senderEmail}`);
         continue;
       }
+      
+      console.log(`[Gmail] ✅ TRACKED: ${senderEmail}`);
 
       const subject = getHeader(headers, 'Subject') || '(No Subject)';
       const toHeader = getHeader(headers, 'To');
@@ -215,7 +220,6 @@ async function fetchGmailEmails(accountEmail) {
         }
       }
 
-      // ── CLASSIFICATION ────────────────────────────────────
       const labelIds = detail.data.labelIds || [];
       const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub);
 
@@ -246,7 +250,7 @@ async function fetchGmailEmails(accountEmail) {
             aiConfidence = aiResult.confidence;
           }
 
-          await new Promise(r => setTimeout(r, 5000)); // 12 RPM, under Gemini's 15 RPM cap
+          await new Promise(r => setTimeout(r, 5000));
         }
       }
 
@@ -272,7 +276,7 @@ async function fetchGmailEmails(accountEmail) {
       else console.error(`[Gmail] Insert error for ${msg.id}:`, error.message);
     }
 
-    console.log(`[Gmail] ${accountEmail}: ${saved} tracked emails saved, ${ignoredNotTracked} non-tracked emails ignored`);
+    console.log(`[Gmail] ${accountEmail}: ${saved} tracked emails SAVED, ${ignoredNotTracked} non-tracked emails IGNORED`);
     return saved;
 
   } catch (err) {
@@ -300,7 +304,6 @@ async function classifyEmailSafe(params, maxRetries = 3) {
   return null;
 }
 
-// ── REPLY CHECK: only tracked buyer emails still status='unreplied' ─────
 async function checkPendingReplies(accountEmail, gmail) {
   try {
     const { data: pending, error } = await supabase
@@ -366,7 +369,6 @@ async function checkPendingReplies(accountEmail, gmail) {
   }
 }
 
-// ── MAIN ─────────────────────────────────────────────────────────────────
 async function runGmailFetcher() {
   const { data: users, error } = await supabase
     .from('users')
@@ -391,7 +393,7 @@ async function runGmailFetcher() {
     return;
   }
 
-  console.log(`[Gmail] Fetching ${allAccounts.length} accounts`);
+  console.log(`[Gmail] Starting fetch for ${allAccounts.length} accounts`);
 
   for (const account of allAccounts) {
     const tokens = await getTokenFromSupabase(account);
