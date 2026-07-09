@@ -1,6 +1,5 @@
 require('dotenv').config();
 const express = require('express');
-const path = require('path');
 const cron = require('node-cron');
 const { runGmailFetcher, runReplyCheckOnly } = require('./gmailFetcher');
 const { send36HourNotification, sendDailyReminder, sendWeeklyReport } = require('./reminderSender');
@@ -9,11 +8,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
 // === ROOT ROUTE ===
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.json({ 
+    status: 'OK',
+    message: 'Email Tracker Backend is running',
+    dashboard: 'https://email-tracker-22-06-2026.onrender.com/dashboard'
+  });
 });
 
 // === HEALTH CHECK ===
@@ -69,6 +71,6 @@ cron.schedule('30 4 * * 6', async () => {
 // === SERVER ===
 app.listen(PORT, () => {
   console.log(`[Server] Running on port ${PORT}`);
-  console.log(`[Server] Dashboard: https://email-tracker-22-06-2026.onrender.com`);
+  console.log(`[Server] Dashboard: https://email-tracker-22-06-2026.onrender.com/dashboard`);
   console.log(`[Cron] Jobs scheduled and running`);
 });
