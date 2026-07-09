@@ -53,15 +53,16 @@ async function fetchEmails(email) {
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
   try {
-    // === LAST 5 DAYS ONLY ===
+    // === HARD LIMIT 1: 5-DAY GMAIL QUERY ===
     const fiveDaysAgo = new Date();
     fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
     const afterDate = fiveDaysAgo.toISOString().split('T')[0];
     const query = `in:inbox after:${afterDate}`;
+    const fiveDaysMs = 5 * 24 * 60 * 60 * 1000;
 
-    console.log(`[Gmail] Fetching ${email} - last 5 days only`);
+    console.log(`[Gmail] LIMIT 1: Fetch from ${afterDate} (5 days)`);
 
-    const { data: messages_result } = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 500 });
+    const { data: messages_result } = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 100 });
     const messages = messages_result?.messages || [];
 
     if (!messages.length) {
@@ -71,6 +72,7 @@ async function fetchEmails(email) {
 
     let saved = 0;
     let skipped = 0;
+    let tooOld = 0;
 
     for (const msg of messages) {
       const { data: exists } = await supabase.from('emails').select('id').eq('email_id', msg.id).single();
@@ -89,17 +91,28 @@ async function fetchEmails(email) {
         sender = fromHeader.toLowerCase().trim();
       }
 
-      // === CHECK IF TRACKED ===
+      // === HARD LIMIT 2: ONLY TRACKED SENDERS ===
       if (!TRACKED.has(sender)) {
         skipped++;
         continue;
       }
 
-      console.log(`[Gmail] TRACKED: ${sender}`);
+      const receivedAtRaw = getHeader(headers, 'Date');
+      const receivedAt = new Date(receivedAtRaw || Date.now()).toISOString();
+      const emailTimeMs = new Date(receivedAt).getTime();
+      const nowMs = Date.now();
+
+      // === HARD LIMIT 3: DOUBLE-CHECK 5-DAY WINDOW ===
+      if ((nowMs - emailTimeMs) > fiveDaysMs) {
+        tooOld++;
+        console.log(`[Gmail] TOO OLD: ${sender}`);
+        continue;
+      }
+
+      console.log(`[Gmail] SAVE: ${sender}`);
       saved++;
 
       const subject = getHeader(headers, 'Subject') || '(No Subject)';
-      const receivedAt = new Date(getHeader(headers, 'Date') || Date.now()).toISOString();
 
       await supabase.from('emails').insert({
         email_id: msg.id,
@@ -119,7 +132,7 @@ async function fetchEmails(email) {
       });
     }
 
-    console.log(`[Gmail] DONE: ${saved} saved, ${skipped} skipped`);
+    console.log(`[Gmail] SAVED: ${saved} | SKIP (not tracked): ${skipped} | TOO OLD: ${tooOld}`);
     return saved;
 
   } catch (err) {
@@ -170,14 +183,10 @@ async function runGmailFetcher() {
 
   if (!allAccounts.length) return;
 
-  console.log(`[Gmail] Starting fetch for ${allAccounts.length} accounts`);
-
   for (const account of allAccounts) {
     await fetchEmails(account);
     await checkReplies(account);
   }
-
-  console.log(`[Gmail] Complete`);
 }
 
 async function runReplyCheckOnly() {
