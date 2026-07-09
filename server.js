@@ -9,12 +9,7 @@ const path = require('path');
 const { google } = require('googleapis');
 const { createClient } = require('@supabase/supabase-js');
 const { runGmailFetcher, saveTokenToSupabase, runReplyCheckOnly } = require('./gmailFetcher');
-// NOTE: aiRescanExistingEmails no longer exists in gmailFetcher.js as of the
-// buyer-allowlist rewrite. It was a bulk-rescan-everything function, which
-// directly contradicts the egress-reduction work done since (skip-if-exists,
-// 48h window, per-thread reply checks). Do not re-add it without redesigning
-// it to respect the same constraints.
-const { sendDailyAgentReminders, sendDailyManagerReminders, sendWeeklyReports } = require('./reminderSender');
+const { sendDailyAgentReminders, sendDailyManagerReminders, sendWeeklyReports, send36HourUnrepliedNotification } = require('./reminderSender');
 
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -147,136 +142,37 @@ app.get('/auth/gmail', (req, res) => {
   const oauth2Client = getOAuthClient();
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline', prompt: 'consent',
-    scope: ['https://www.googleapis.com/auth/gmail.readonly', 'email', 'profile'],
+    scope: ['https://www.googleapis.com/auth/gmail.readonly'],
     state: user.email
   });
   res.redirect(url);
 });
 
-// ─── GMAIL STATUS ────────────────────────────────────────────────
-app.get('/api/gmail/status', authMiddleware, async (req, res) => {
-  const { data: user } = await supabase.from('users').select('account_email, gmail_token').eq('id', req.user.id).single();
-  const account = user?.account_email || req.user.account_email;
-  if (!account) return res.json({ connected: false });
-  res.json({ connected: !!(user?.gmail_token), account });
-});
-
-// ─── FULL EMAIL BODY ─────────────────────────────────────────────
-app.get('/api/emails/:emailId/body', authMiddleware, async (req, res) => {
-  try {
-    const { emailId } = req.params;
-
-    // Get email record from Supabase
-    const { data: emailRecord } = await supabase
-      .from('emails')
-      .select('account, email_id')
-      .eq('email_id', emailId)
-      .single();
-
-    if (!emailRecord) return res.json({ body: null, error: 'Email not found' });
-
-    // ✅ FIXED: use account_email column (not email)
-    const { data: userRecord } = await supabase
-      .from('users')
-      .select('gmail_token')
-      .eq('account_email', emailRecord.account)
-      .single();
-
-    if (!userRecord?.gmail_token) return res.json({ body: null, error: 'No token for account' });
-
-    const tokens = JSON.parse(userRecord.gmail_token);
-    const oauth2Client = getOAuthClient();
-    oauth2Client.setCredentials(tokens);
-
-    oauth2Client.on('tokens', async (newTokens) => {
-      const updated = { ...tokens, ...newTokens };
-      await supabase.from('users').update({ gmail_token: JSON.stringify(updated) }).eq('account_email', emailRecord.account);
-    });
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    const msgRes = await gmail.users.messages.get({
-      userId: 'me',
-      id: emailRecord.email_id,
-      format: 'full'
-    });
-
-    const payload = msgRes.data.payload;
-
-    function extractBody(payload) {
-      if (!payload) return { body: '', mimeType: 'text/plain' };
-
-      if (payload.body?.data) {
-        return {
-          body: Buffer.from(payload.body.data, 'base64').toString('utf-8'),
-          mimeType: payload.mimeType || 'text/plain'
-        };
-      }
-
-      if (payload.parts) {
-        let htmlBody = '';
-        let textBody = '';
-
-        function searchParts(parts) {
-          for (const part of parts) {
-            if (part.mimeType === 'text/html' && part.body?.data) {
-              htmlBody = Buffer.from(part.body.data, 'base64').toString('utf-8');
-            }
-            if (part.mimeType === 'text/plain' && part.body?.data) {
-              textBody = Buffer.from(part.body.data, 'base64').toString('utf-8');
-            }
-            if (part.parts) searchParts(part.parts);
-          }
-        }
-
-        searchParts(payload.parts);
-
-        if (htmlBody) return { body: htmlBody, mimeType: 'text/html' };
-        if (textBody) return { body: textBody, mimeType: 'text/plain' };
-      }
-
-      return { body: '', mimeType: 'text/plain' };
-    }
-
-    const { body, mimeType } = extractBody(payload);
-    res.json({ body, mimeType });
-
-  } catch (err) {
-    console.error('Email body fetch error:', err.message);
-    res.json({ body: null, error: err.message });
-  }
-});
-
-// ─── ACCOUNT FILTER ──────────────────────────────────────────────
+// ─── STATS ───────────────────────────────────────────────────────
 async function getAccountFilter(role, account_email, email) {
-  if (role === 'agent') return [account_email].filter(Boolean);
+  if (role === 'agent') return [account_email];
   if (role === 'manager') {
-    const { data } = await supabase.from('users').select('account_email').eq('manager_email', email);
-    const accounts = (data || []).map(a => a.account_email).filter(Boolean);
-    if (account_email) accounts.push(account_email);
-    return [...new Set(accounts)];
+    const { data: agents } = await supabase.from('users').select('account_email').eq('manager_email', email).eq('role', 'agent');
+    return (agents || []).map(a => a.account_email).filter(Boolean);
   }
-  const { data } = await supabase.from('users').select('account_email').eq('is_active', true);
-  return [...new Set((data || []).map(a => a.account_email).filter(Boolean))];
+  const { data: users } = await supabase.from('users').select('account_email').eq('is_active', true);
+  return (users || []).map(u => u.account_email).filter(Boolean);
 }
 
-// ─── STATS ───────────────────────────────────────────────────────
 app.get('/api/stats', authMiddleware, async (req, res) => {
   const { role, account_email, email } = req.user;
-  // IST = UTC+5:30, so IST midnight = UTC 18:30 previous day
-  const now = new Date();
-  const istOffset = 5.5 * 60 * 60 * 1000; // 5h30m in ms
-  const istNow = new Date(now.getTime() + istOffset);
-  const istMidnight = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
-  const today = new Date(istMidnight.getTime() - istOffset); // convert back to UTC
   const accountFilter = await getAccountFilter(role, account_email, email);
   if (!accountFilter.length) return res.json({ total: 0, replied: 0, unreplied: 0, today: 0, repliedToday: 0, noReplyNeeded: 0, internal: 0 });
-  const [t, r, u, d, rd, nr, int_] = await Promise.all([
+  const today = new Date().toDateString();
+  const todayStart = new Date(today).toISOString();
+  const [
+    { count: t }, { count: r }, { count: u }, { count: d }, { count: rd }, { count: nr }, { count: int_ }
+  ] = await Promise.all([
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'replied'),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'unreplied'),
-    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).gte('received_at', today.toISOString()).in('status', ['unreplied', 'replied']),
-    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'replied').gte('replied_at', today.toISOString()),
+    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).gte('received_at', todayStart),
+    supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).gte('received_at', todayStart).eq('status', 'replied'),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'no_reply_needed'),
     supabase.from('emails').select('id', { count: 'exact' }).in('account', accountFilter).eq('status', 'internal')
   ]);
@@ -404,25 +300,35 @@ app.post('/api/trigger/fetch', authMiddleware, async (req, res) => {
   res.json({ message: 'Fetch triggered' });
 });
 
-// ─── AI RESCAN ───────────────────────────────────────────────────
-// REMOVED: this called aiRescanExistingEmails(), which no longer exists in
-// gmailFetcher.js since the buyer-allowlist rewrite. The call was undefined,
-// threw synchronously inside an unawaited async handler, and became an
-// unhandled promise rejection — which crashes the entire Node process on
-// Node >=15's default unhandledRejection behavior, not just this one request.
-// If a manual re-classification tool is needed later, it should be built to
-// scope only to status='unreplied' rows for tracked buyer domains (small,
-// bounded set) — not a full-table rescan, which is what this used to do.
+// ─── MANUAL TRIGGER 36-HOUR CHECK ───────────────────────────────
+app.post('/api/trigger/36hour-check', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'senior_manager') return res.status(403).json({ error: 'Forbidden' });
+  send36HourUnrepliedNotification().catch(console.error);
+  res.json({ message: '36-hour check triggered' });
+});
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
+// ─── CRON JOBS ───────────────────────────────────────────────────
+// Fetch every 5 minutes
 cron.schedule('*/5 * * * *', () => runGmailFetcher().catch(console.error));
+
+// Reply check every 10 minutes
 cron.schedule('*/10 * * * *', () => runReplyCheckOnly().catch(console.error));
-cron.schedule('30 3 * * *', async () => { await sendDailyAgentReminders(); await sendDailyManagerReminders(); });
+
+// Daily reminders at 9:30 AM IST (03:30 UTC)
+cron.schedule('30 3 * * *', async () => { 
+  await sendDailyAgentReminders(); 
+  await sendDailyManagerReminders(); 
+});
+
+// 36-HOUR UNREPLIED CHECK every 2 hours
+cron.schedule('0 */2 * * *', () => send36HourUnrepliedNotification().catch(console.error));
+
+// Weekly reports every Saturday at 10:30 AM IST (04:30 UTC)
 cron.schedule('30 4 * * 6', () => sendWeeklyReports().catch(console.error));
 
 app.listen(process.env.PORT || 3000, () => {
   console.log(`✅ Server running on port ${process.env.PORT || 3000}`);
   setTimeout(() => runGmailFetcher().catch(console.error), 5000);
 });
-
