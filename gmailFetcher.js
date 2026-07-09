@@ -281,32 +281,23 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
       const senderName = from.replace(/<.+>/, '').trim().replace(/"/g, '');
       const receivedAt = date ? new Date(date).toISOString() : new Date().toISOString();
 
-      // ── GATE: must match internal pattern OR buyer domain OR tracked keyword ──
-      // Keyword match is a real widening of scope beyond the strict domain allowlist —
-      // any sender mentioning a tracked company name in subject/body/their own address
-      // now gets tracked, not just known buyer domains. Confirmed explicitly by user.
-      const isInternal = isInternalEmail(senderEmail, senderName, internalPatterns);
-      const isDomainBuyer = isBuyerDomain(senderEmail, buyerDomains);
-      const isKeywordBuyer = matchesTrackedKeyword(
-        subject, detail.data.snippet, senderEmail, senderName, trackedKeywords
-      );
+      // ── GATE: ONLY track the 15 specific tracked emails ──
+      // The 15 emails are in internal_identifiers table but should be treated as BUYER emails
+      // (shown in unreplied tab), not internal emails.
+      const isTrackedEmail = isInternalEmail(senderEmail, senderName, internalPatterns);
 
-      const isBuyer = !isInternal && (isDomainBuyer || isKeywordBuyer);
-
-      if (!isInternal && !isBuyer) {
+      if (!isTrackedEmail) {
         ignoredNonTracked++;
-        continue; // not inserted at all — not a buyer, not internal
+        continue; // not inserted at all — not a tracked email
       }
 
       let status;
       let aiReason = null;
       let aiConfidence = null;
 
-      if (isInternal) {
-        status = 'internal';
-        aiReason = 'Internal identifier match';
-        aiConfidence = 'high';
-      } else {
+      // All tracked emails are treated as BUYER emails (unreplied/replied/no_reply_needed)
+      // NOT as internal emails
+      {
         // Buyer-domain email — still run noise checks, a buyer's own
         // automated system mail shouldn't count as a pending reply
         const accountLower = accountEmail.toLowerCase();
