@@ -2,21 +2,203 @@ require('dotenv').config();
 const { google } = require('googleapis');
 const { createClient } = require('@supabase/supabase-js');
 const { classifyEmail } = require('./aiClassifier');
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const TRACKED_SENDER_EMAILS = new Set(['nirvana.balsingh@wefashion.com', 'ilona.van.de.schootbrugge@wefashion.com', 'kurt@kurtklingberg.se', 'cg@carebyme.dk', 'ivy.ho@polarnopyret.se', 'jo@lakor.dk', 'stine@lakor.dk', 'johnny.lai@polarnopyret.se', 'rishabh.shrivastava@ul.com', 'jeppe@lakor.dk', 'fiona@littleones.ie', 'mg@carebyme.dk', 'bettina@gai-lisva.com', 'camillad@luxkids.dk', 'emma@emmamalena.com'].map(e => e.toLowerCase()));
-const OBVIOUS_SYSTEM_DOMAINS = ['railway.app', 'github.com', 'github.io', 'render.com', 'vercel.app', 'google.com', 'accounts.google.com', 'googlemail.com', 'linkedin.com', 'twitter.com', 'facebook.com', 'instagram.com', 'mailchimp.com', 'sendgrid.net', 'amazonses.com', 'brevo.com', 'hdfcbank.com', 'sbi.co.in', 'icicibank.com', 'axisbank.com', 'kotak.com', 'yesbank.in', 'indusind.com', 'canarabank.com', 'barodampbank.com', 'pnbindia.com', 'paytm.com', 'phonepe.com', 'razorpay.com', 'stripe.com', 'paypal.com', 'indiamart.com', 'tradeindia.com', 'alibaba.com', 'apollo.io', 'vultr.com', 'anthropic.com', 'dyad.sh', 'zoom.us', 'slack.com', 'notion.so', 'asana.com', 'monday.com', 'dhl.com', 'fedex.com', 'ups.com', 'aramex.com', 'shiprocket.com', 'ul.com', 'intertek.com', 'tuv.com', 'dnvgl.com', 'ftncv.com', 'napp.org', 'fairtrade.net'];
-const DO_NOT_REPLY_KEYWORDS = ['notification-only address', 'do not reply', 'do-not-reply', 'cannot accept incoming', 'no-reply', 'noreply', 'automated message', 'automated response', 'this is an automated', 'please do not respond', 'please do not reply', 'do not respond to this', 'mailer-daemon', 'postmaster', 'undeliverable', 'out of office'];
-const FYI_KEYWORDS = ['for your information', 'for information only', 'for your reference', 'fyi', 'for awareness', 'please note', 'for your attention', 'inward team has already sent', 'already processed', 'already handled', 'in case you need', 'status update', 'information only', 'tracking update', 'shipment status', 'order confirmation', 'invoice attached', 'attached invoice'];
-const OBVIOUS_SYSTEM_KEYWORDS = ['noreply', 'no-reply', 'donotreply', 'do-not-reply', 'mailer-daemon', 'postmaster', 'billing', 'invoice', 'receipt', 'notification', 'alert', 'automated'];
+
+const TRACKED_SENDER_EMAILS = new Set([
+  'nirvana.balsingh@wefashion.com',
+  'ilona.van.de.schootbrugge@wefashion.com',
+  'kurt@kurtklingberg.se',
+  'cg@carebyme.dk',
+  'ivy.ho@polarnopyret.se',
+  'jo@lakor.dk',
+  'stine@lakor.dk',
+  'johnny.lai@polarnopyret.se',
+  'rishabh.shrivastava@ul.com',
+  'jeppe@lakor.dk',
+  'fiona@littleones.ie',
+  'mg@carebyme.dk',
+  'bettina@gai-lisva.com',
+  'camillad@luxkids.dk',
+  'emma@emmamalena.com'
+].map(e => e.toLowerCase()));
+
+const OBVIOUS_SYSTEM_DOMAINS = ['railway.app', 'github.com', 'render.com', 'google.com', 'linkedin.com', 'mailchimp.com', 'ul.com'];
 const GMAIL_LABELS_TO_SKIP = ['CATEGORY_PROMOTIONS', 'CATEGORY_UPDATES', 'CATEGORY_SOCIAL', 'SPAM'];
-function isObviouslySystem(senderEmail, labelIds, listUnsub) { if (listUnsub) return true; if (labelIds.some(l => GMAIL_LABELS_TO_SKIP.includes(l))) return true; const lower = (senderEmail || '').toLowerCase(); const domain = lower.split('@')[1] || ''; if (OBVIOUS_SYSTEM_DOMAINS.some(d => domain.includes(d))) return true; if (OBVIOUS_SYSTEM_KEYWORDS.some(k => lower.includes(k))) return true; return false; }
-function detectByBodyContent(bodySnippet) { const lower = (bodySnippet || '').toLowerCase(); if (DO_NOT_REPLY_KEYWORDS.some(k => lower.includes(k))) { return { status: 'no_reply_needed', reason: 'Notification-only email (body text)' }; } if (FYI_KEYWORDS.some(k => lower.includes(k))) { return { status: 'no_reply_needed', reason: 'Informational email (for reference only)' }; } return null; }
-function getHeader(headers, name) { return headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || ''; }
-async function getTokenFromSupabase(accountEmail) { const { data, error } = await supabase.from('users').select('gmail_token').eq('account_email', accountEmail).single(); if (error || !data?.gmail_token) { console.log(`[Gmail] No token`); return null; } try { return typeof data.gmail_token === 'string' ? JSON.parse(data.gmail_token) : data.gmail_token; } catch { return null; } }
-async function saveTokenToSupabase(accountEmail, tokens) { const { error } = await supabase.from('users').update({ gmail_token: JSON.stringify(tokens) }).eq('account_email', accountEmail); if (error) console.error(`[Gmail] Error:`, error.message); }
-async function fetchGmailEmails(accountEmail) { const tokens = await getTokenFromSupabase(accountEmail); if (!tokens) return 0; const oauth2Client = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, process.env.GMAIL_REDIRECT_URI); oauth2Client.setCredentials(tokens); oauth2Client.on('tokens', async (newTokens) => { await saveTokenToSupabase(accountEmail, { ...tokens, ...newTokens }); }); const gmail = google.gmail({ version: 'v1', auth: oauth2Client }); try { const fiveDaysAgo = new Date(); fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5); const afterDate = fiveDaysAgo.toISOString().split('T')[0]; const query = `in:inbox after:${afterDate}`; console.log(`[Gmail] Fetch ${accountEmail}`); const messages = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 500 }); if (!messages.data.messages || messages.data.messages.length === 0) { console.log(`[Gmail] No emails`); return 0; } let saved = 0; let ignoredNotTracked = 0; for (const msg of messages.data.messages) { const { data: existing } = await supabase.from('emails').select('id').eq('email_id', msg.id).single(); if (existing) continue; const detail = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' }); const headers = detail.data.payload.headers || []; const fromHeader = getHeader(headers, 'From') || ''; let senderEmail = ''; const emailMatch = fromHeader.match(/<(.+?)>/); if (emailMatch && emailMatch[1]) { senderEmail = emailMatch[1].toLowerCase().trim(); } else { senderEmail = fromHeader.toLowerCase().trim(); } const senderName = fromHeader.split('<')[0].trim(); if (!TRACKED_SENDER_EMAILS.has(senderEmail)) { ignoredNotTracked++; continue; } const subject = getHeader(headers, 'Subject') || '(No Subject)'; const toHeader = getHeader(headers, 'To'); const ccHeader = getHeader(headers, 'Cc'); const listUnsub = getHeader(headers, 'List-Unsubscribe') || ''; const receivedAtRaw = getHeader(headers, 'Date') || detail.data.internalDate; let receivedAt = new Date().toISOString(); if (receivedAtRaw) { const parsed = new Date(receivedAtRaw); if (!isNaN(parsed.getTime())) { receivedAt = parsed.toISOString(); } } const labelIds = detail.data.labelIds || []; const obviouslySystem = isObviouslySystem(senderEmail, labelIds, listUnsub); let status = 'unreplied'; let aiReason = ''; let aiConfidence = 'medium'; if (obviouslySystem) { status = 'no_reply_needed'; aiReason = 'Auto-detected: system'; aiConfidence = 'high'; } else { const bodyDetection = detectByBodyContent(detail.data.snippet); if (bodyDetection) { status = bodyDetection.status; aiReason = bodyDetection.reason; aiConfidence = 'high'; } else { const aiResult = await classifyEmailSafe({ senderEmail, senderName, subject, bodyPreview: detail.data.snippet || '', toHeader, ccHeader, accountEmail }); if (aiResult) { status = aiResult.needs_reply ? 'unreplied' : 'no_reply_needed'; aiReason = aiResult.reason; aiConfidence = aiResult.confidence; } await new Promise(r => setTimeout(r, 5000)); } } const emailData = { email_id: msg.id, thread_id: detail.data.threadId, account: accountEmail, source: 'gmail', sender_name: senderName, sender_email: senderEmail, subject: subject, body_preview: detail.data.snippet || '', email_link: `https://mail.google.com/mail/u/0/#inbox/${msg.id}`, received_at: receivedAt, status: status, is_system_generated: status === 'no_reply_needed', ai_reason: aiReason, ai_confidence: aiConfidence, }; const { error } = await supabase.from('emails').insert(emailData); if (!error) saved++; } console.log(`[Gmail] SAVED: ${saved}, SKIPPED: ${ignoredNotTracked}`); return saved; } catch (err) { console.error(`[Gmail] Error:`, err.message); return 0; } }
-async function classifyEmailSafe(params, maxRetries = 3) { for (let attempt = 0; attempt <= maxRetries; attempt++) { try { return await classifyEmail(params); } catch (err) { const is429 = err?.status === 429 || err?.message?.includes('429'); const isLast = attempt === maxRetries; if (!is429 || isLast) { console.error(`[AI] Failed:`, err.message); return null; } const backoffMs = 5000 * Math.pow(2, attempt); await new Promise(r => setTimeout(r, backoffMs)); } } return null; }
-async function checkPendingReplies(accountEmail, gmail) { try { const { data: pending, error } = await supabase.from('emails').select('id, thread_id, received_at, subject').eq('account', accountEmail).eq('status', 'unreplied'); if (error || !pending?.length) return; const toMarkReplied = []; for (const email of pending) { if (!email.thread_id) continue; try { const thread = await gmail.users.threads.get({ userId: 'me', id: email.thread_id, format: 'metadata', metadataHeaders: ['From', 'Date'] }); const messages = thread.data.messages || []; const receivedAtMs = new Date(email.received_at).getTime(); const hasReply = messages.some(m => { const isSent = (m.labelIds || []).includes('SENT'); const msgDateMs = parseInt(m.internalDate || '0'); return isSent && msgDateMs > receivedAtMs; }); if (hasReply) toMarkReplied.push(email.id); } catch (threadErr) {} } if (toMarkReplied.length) { await supabase.from('emails').update({ status: 'replied', replied_at: new Date().toISOString(), updated_at: new Date().toISOString() }).in('id', toMarkReplied); } } catch (err) { console.error(`[Gmail] Reply check error:`, err.message); } }
-async function runGmailFetcher() { const { data: users, error } = await supabase.from('users').select('account_email, gmail_token').not('gmail_token', 'is', null); if (error) { console.error('[Gmail] Error:', error.message); return; } const envAccounts = (process.env.GMAIL_ACCOUNTS || '').split(',').map(e => e.trim()).filter(Boolean); const allAccounts = [...new Set([...(users || []).map(u => u.account_email), ...envAccounts])]; if (!allAccounts.length) return; for (const account of allAccounts) { const tokens = await getTokenFromSupabase(account); if (!tokens) continue; await fetchGmailEmails(account); const oauth2Client = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, process.env.GMAIL_REDIRECT_URI); oauth2Client.setCredentials(tokens); const gmail = google.gmail({ version: 'v1', auth: oauth2Client }); await checkPendingReplies(account, gmail); } }
-async function runReplyCheckOnly() { const { data: users } = await supabase.from('users').select('account_email, gmail_token').not('gmail_token', 'is', null); const envAccounts = (process.env.GMAIL_ACCOUNTS || '').split(',').map(e => e.trim()).filter(Boolean); const allAccounts = [...new Set([...(users || []).map(u => u.account_email), ...envAccounts])]; if (!allAccounts.length) return; for (const account of allAccounts) { const tokens = await getTokenFromSupabase(account); if (!tokens) continue; const oauth2Client = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, process.env.GMAIL_REDIRECT_URI); oauth2Client.setCredentials(tokens); const gmail = google.gmail({ version: 'v1', auth: oauth2Client }); await checkPendingReplies(account, gmail); } }
+
+function getHeader(headers, name) {
+  return headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
+}
+
+async function getTokenFromSupabase(accountEmail) {
+  const { data, error } = await supabase.from('users').select('gmail_token').eq('account_email', accountEmail).single();
+  if (error || !data?.gmail_token) return null;
+  try {
+    return typeof data.gmail_token === 'string' ? JSON.parse(data.gmail_token) : data.gmail_token;
+  } catch {
+    return null;
+  }
+}
+
+async function saveTokenToSupabase(accountEmail, tokens) {
+  await supabase.from('users').update({ gmail_token: JSON.stringify(tokens) }).eq('account_email', accountEmail);
+}
+
+async function fetchGmailEmails(accountEmail) {
+  const tokens = await getTokenFromSupabase(accountEmail);
+  if (!tokens) return 0;
+
+  const oauth2Client = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, process.env.GMAIL_REDIRECT_URI);
+  oauth2Client.setCredentials(tokens);
+  oauth2Client.on('tokens', async (newTokens) => {
+    await saveTokenToSupabase(accountEmail, { ...tokens, ...newTokens });
+  });
+
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+  try {
+    const fiveDaysAgo = new Date();
+    fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
+    const afterDate = fiveDaysAgo.toISOString().split('T')[0];
+    const query = `in:inbox after:${afterDate}`;
+
+    console.log(`[Gmail] Fetching ${accountEmail}`);
+
+    const messages = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 500 });
+
+    if (!messages.data.messages || messages.data.messages.length === 0) {
+      console.log(`[Gmail] No emails`);
+      return 0;
+    }
+
+    let saved = 0;
+    let skipped = 0;
+
+    for (const msg of messages.data.messages) {
+      const { data: existing } = await supabase.from('emails').select('id').eq('email_id', msg.id).single();
+      if (existing) continue;
+
+      const detail = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' });
+      const headers = detail.data.payload.headers || [];
+      const fromHeader = getHeader(headers, 'From') || '';
+      
+      let senderEmail = '';
+      const match = fromHeader.match(/<(.+?)>/);
+      if (match && match[1]) {
+        senderEmail = match[1].toLowerCase().trim();
+      } else {
+        senderEmail = fromHeader.toLowerCase().trim();
+      }
+
+      if (!TRACKED_SENDER_EMAILS.has(senderEmail)) {
+        skipped++;
+        console.log(`[Gmail] SKIP: ${senderEmail}`);
+        continue;
+      }
+
+      console.log(`[Gmail] TRACK: ${senderEmail}`);
+
+      const subject = getHeader(headers, 'Subject') || '(No Subject)';
+      const toHeader = getHeader(headers, 'To');
+      const ccHeader = getHeader(headers, 'Cc');
+      const receivedAtRaw = getHeader(headers, 'Date');
+
+      let receivedAt = new Date().toISOString();
+      if (receivedAtRaw) {
+        const parsed = new Date(receivedAtRaw);
+        if (!isNaN(parsed.getTime())) {
+          receivedAt = parsed.toISOString();
+        }
+      }
+
+      const emailData = {
+        email_id: msg.id,
+        thread_id: detail.data.threadId,
+        account: accountEmail,
+        source: 'gmail',
+        sender_name: fromHeader.split('<')[0].trim(),
+        sender_email: senderEmail,
+        subject: subject,
+        body_preview: detail.data.snippet || '',
+        email_link: `https://mail.google.com/mail/u/0/#inbox/${msg.id}`,
+        received_at: receivedAt,
+        status: 'unreplied',
+        is_system_generated: false,
+        ai_reason: '',
+        ai_confidence: 'medium',
+      };
+
+      const { error } = await supabase.from('emails').insert(emailData);
+      if (!error) saved++;
+    }
+
+    console.log(`[Gmail] RESULT: ${saved} TRACKED, ${skipped} SKIPPED`);
+    return saved;
+  } catch (err) {
+    console.error(`[Gmail] Error:`, err.message);
+    return 0;
+  }
+}
+
+async function checkPendingReplies(accountEmail, gmail) {
+  try {
+    const { data: pending } = await supabase.from('emails').select('id, thread_id, received_at').eq('account', accountEmail).eq('status', 'unreplied');
+    if (!pending?.length) return;
+
+    for (const email of pending) {
+      if (!email.thread_id) continue;
+      try {
+        const thread = await gmail.users.threads.get({ userId: 'me', id: email.thread_id, format: 'metadata' });
+        const messages = thread.data.messages || [];
+        const receivedAtMs = new Date(email.received_at).getTime();
+        const hasReply = messages.some(m => {
+          const isSent = (m.labelIds || []).includes('SENT');
+          const msgDateMs = parseInt(m.internalDate || '0');
+          return isSent && msgDateMs > receivedAtMs;
+        });
+        if (hasReply) {
+          await supabase.from('emails').update({ status: 'replied', replied_at: new Date().toISOString() }).eq('id', email.id);
+        }
+      } catch (err) {}
+    }
+  } catch (err) {
+    console.error(`[Gmail] Reply check error:`, err.message);
+  }
+}
+
+async function runGmailFetcher() {
+  const { data: users } = await supabase.from('users').select('account_email, gmail_token').not('gmail_token', 'is', null);
+  const envAccounts = (process.env.GMAIL_ACCOUNTS || '').split(',').map(e => e.trim()).filter(Boolean);
+  const allAccounts = [...new Set([...(users || []).map(u => u.account_email), ...envAccounts])];
+  
+  if (!allAccounts.length) return;
+
+  for (const account of allAccounts) {
+    const tokens = await getTokenFromSupabase(account);
+    if (!tokens) continue;
+    
+    await fetchGmailEmails(account);
+    
+    const oauth2Client = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, process.env.GMAIL_REDIRECT_URI);
+    oauth2Client.setCredentials(tokens);
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    await checkPendingReplies(account, gmail);
+  }
+}
+
+async function runReplyCheckOnly() {
+  const { data: users } = await supabase.from('users').select('account_email, gmail_token').not('gmail_token', 'is', null);
+  if (!users?.length) return;
+  
+  for (const user of users) {
+    const tokens = await getTokenFromSupabase(user.account_email);
+    if (!tokens) continue;
+    
+    const oauth2Client = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, process.env.GMAIL_REDIRECT_URI);
+    oauth2Client.setCredentials(tokens);
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    await checkPendingReplies(user.account_email, gmail);
+  }
+}
+
 module.exports = { runGmailFetcher, saveTokenToSupabase, runReplyCheckOnly };
