@@ -12,7 +12,8 @@
 // means adding a row to tracked_buyer_domains, not a code change.
 //
 // Still retained from prior fixes:
-//   - 48h rolling fetch window (survives extended outages, not just cold-start spin-down)
+//   - 5-day rolling fetch window (only tracks last 5 days)
+//   - Auto-cleanup: deletes emails older than 5 days
 //   - skip-if-exists dedup before any classification/AI/insert work
 //   - reply-check scoped to status='unreplied' rows only, one thread.get() per pending row
 //     (no bulk 500-message SENT scan)
@@ -219,10 +220,9 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
   try {
-    // 48h window — survives extended outages (deploy failures, quota blocks),
-    // not just brief cold-start spin-downs. Still has a hard ceiling beyond 48h;
-    // historyId-based incremental sync would remove that ceiling entirely if ever needed.
-    const windowStart = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    // ═══ 5-DAY WINDOW ═══
+    // Only fetch emails from the last 5 days
+    const windowStart = new Date(Date.now() - (5 * 24 * 60 * 60 * 1000));
     const after = Math.floor(windowStart.getTime() / 1000);
 
     // NOT narrowing this query to from:(buyer domains) server-side — Gmail's from:
@@ -237,7 +237,7 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
     });
 
     const messages = listRes.data.messages || [];
-    console.log(`[Gmail] ${accountEmail}: ${messages.length} messages in 48h window`);
+    console.log(`[Gmail] ${accountEmail}: ${messages.length} messages in 5-day window`);
 
     if (!messages.length) return 0;
 
@@ -268,6 +268,7 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
 
       const headers = detail.data.payload?.headers || [];
       const labelIds = detail.data.labelIds || [];
+
       const from = getHeader(headers, 'From');
       const toHeader = getHeader(headers, 'To');
       const ccHeader = getHeader(headers, 'Cc');
@@ -289,6 +290,7 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
       const isKeywordBuyer = matchesTrackedKeyword(
         subject, detail.data.snippet, senderEmail, senderName, trackedKeywords
       );
+
       const isBuyer = !isInternal && (isDomainBuyer || isKeywordBuyer);
 
       if (!isInternal && !isBuyer) {
@@ -311,8 +313,8 @@ async function fetchGmailEmails(accountEmail, domainConfig) {
         const inTo = toHeader.toLowerCase().includes(accountLower);
         const inCc = ccHeader.toLowerCase().includes(accountLower);
         const isBcc = !inTo && !inCc;
-
         const isOnlyCc = !inTo && inCc;
+
         const bodySnippet = (detail.data.snippet || '').toLowerCase();
         const amitMentioned = bodySnippet.includes('amit');
         const ccNoAmit = isOnlyCc && !amitMentioned;
@@ -452,6 +454,25 @@ async function checkPendingReplies(accountEmail, gmail) {
   }
 }
 
+// ── AUTO-CLEANUP: Delete emails older than 5 days ──────────────────
+async function cleanupOldEmails() {
+  try {
+    const cutoffDate = new Date(Date.now() - (5 * 24 * 60 * 60 * 1000)).toISOString();
+    const { error } = await supabase
+      .from('emails')
+      .delete()
+      .lt('received_at', cutoffDate);
+
+    if (error) {
+      console.error('[Gmail] Cleanup error:', error.message);
+    } else {
+      console.log('[Gmail] Cleanup complete: deleted emails older than 5 days');
+    }
+  } catch (err) {
+    console.error('[Gmail] Cleanup failed:', err.message);
+  }
+}
+
 // ── MAIN ─────────────────────────────────────────────────────────
 async function runGmailFetcher() {
   const domainConfig = await loadDomainConfig();
@@ -496,6 +517,9 @@ async function runGmailFetcher() {
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     await checkPendingReplies(account, gmail);
   }
+
+  // Auto-cleanup: delete emails older than 5 days
+  await cleanupOldEmails();
 
   console.log('[Gmail] Done.');
 }
