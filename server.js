@@ -18,6 +18,11 @@ app.get('/', (req, res) => {
   });
 });
 
+// === DASHBOARD ROUTE ===
+app.get('/dashboard', (req, res) => {
+  res.sendFile(__dirname + '/index.html');
+});
+
 // === HEALTH CHECK ===
 app.get('/health', (req, res) => {
   res.json({ status: 'OK' });
