@@ -2,9 +2,10 @@
   "name": "kishor-email-tracker",
   "version": "1.0.0",
   "description": "Internal email tracker and CRM for Kishor Exports",
-  "main": "backend/server.js",
-  "scripts": {
-    "start": "node backend/server.js"
+ "main": "server.js",
+"scripts": {
+  "start": "node server.js"
+}
   },
   "dependencies": {
     "@azure/msal-node": "^2.6.0",
